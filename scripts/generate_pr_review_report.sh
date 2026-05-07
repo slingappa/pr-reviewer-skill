@@ -17,6 +17,7 @@ Options:
   --style-family <name> Style family hint: auto|linux|qemu|uboot|edk2|generic
   --checkpatch-inline-cap <n> Max checkpatch-derived inline drafts (0 = unlimited; default: 0)
   --comment-batch-size <n> Number of approved comments per submission batch (default: 50)
+  --cross-ecosystem-mode <mode> Rule/report breadth: repo-aware|full (default: repo-aware)
   --no-fetch-checkpatch Disable remote fetch fallback when local checker is missing
   --allow-scope-mismatch Do not fail when local diff file set differs from GitHub PR file set
   --output <file>       Write report to file (default: stdout)
@@ -44,6 +45,7 @@ style_family="auto"
 fetch_checkpatch=1
 checkpatch_inline_cap=0
 comment_batch_size=50
+cross_ecosystem_mode="repo-aware"
 allow_scope_mismatch=0
 output_file=""
 report_file=""
@@ -81,6 +83,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --comment-batch-size)
       comment_batch_size="${2:-50}"
+      shift 2
+      ;;
+    --cross-ecosystem-mode)
+      cross_ecosystem_mode="${2:-repo-aware}"
       shift 2
       ;;
     --no-fetch-checkpatch)
@@ -129,6 +135,10 @@ esac
 [[ "$checkpatch_inline_cap" =~ ^[0-9]+$ ]] || err "Invalid --checkpatch-inline-cap: $checkpatch_inline_cap (use integer >= 0)"
 [[ "$comment_batch_size" =~ ^[0-9]+$ ]] || err "Invalid --comment-batch-size: $comment_batch_size (use integer >= 1)"
 [[ "$comment_batch_size" -ge 1 ]] || err "Invalid --comment-batch-size: $comment_batch_size (use integer >= 1)"
+case "$cross_ecosystem_mode" in
+  repo-aware|full) ;;
+  *) err "Invalid --cross-ecosystem-mode: $cross_ecosystem_mode (use repo-aware|full)" ;;
+esac
 
 pr_json="$context_dir/pr.json"
 files_json="$context_dir/files.json"
@@ -695,13 +705,40 @@ done < <(jq -r '.[] | select((.in_reply_to_id // "") == "") | [(.id|tostring), (
 
 emit_group() {
   local title="$1"
-  echo "### ${title}" >> "$topic_tasks_md"
+  current_topic_group_enabled=1
+  if [[ "$cross_ecosystem_mode" == "repo-aware" && "$style_family_detected" != "generic" ]]; then
+    current_topic_group_enabled=0
+    case "$style_family_detected" in
+      edk2|linux|uboot)
+        [[ "$title" == "Linux Kernel Submission Checklist" || \
+           "$title" == "Google Code Review Standard" || \
+           "$title" == "OWASP Secure Code Review" ]] && current_topic_group_enabled=1
+        ;;
+      qemu)
+        [[ "$title" == "QEMU Patch Workflow Expectations" || \
+           "$title" == "Linux Kernel Submission Checklist" || \
+           "$title" == "Google Code Review Standard" || \
+           "$title" == "OWASP Secure Code Review" ]] && current_topic_group_enabled=1
+        ;;
+      *)
+        current_topic_group_enabled=1
+        ;;
+    esac
+  fi
+
+  if [[ "$current_topic_group_enabled" -eq 1 ]]; then
+    echo "### ${title}" >> "$topic_tasks_md"
+  else
+    omitted_topic_groups=$((omitted_topic_groups + 1))
+  fi
 }
 
 emit_task() {
   local status="$1"
   local text="$2"
-  echo "- [${status}] ${text}" >> "$topic_tasks_md"
+  if [[ "$current_topic_group_enabled" -eq 1 ]]; then
+    echo "- [${status}] ${text}" >> "$topic_tasks_md"
+  fi
 }
 
 task_status_bool() {
@@ -724,11 +761,36 @@ task_status_not_bool() {
 
 emit_matrix_group() {
   local title="$1"
-  {
-    echo "### ${title}"
-    echo "| Rule ID | Rule | Status | Evidence/Notes | Source |"
-    echo "| --- | --- | --- | --- | --- |"
-  } >> "$rule_matrix_md"
+  current_matrix_group_enabled=1
+  if [[ "$cross_ecosystem_mode" == "repo-aware" && "$style_family_detected" != "generic" ]]; then
+    current_matrix_group_enabled=0
+    case "$style_family_detected" in
+      edk2|linux|uboot)
+        [[ "$title" == "Linux Coding-Style Rule Matrix" || \
+           "$title" == "Google Reviewer Rule Matrix" || \
+           "$title" == "OWASP Rule Matrix" ]] && current_matrix_group_enabled=1
+        ;;
+      qemu)
+        [[ "$title" == "QEMU Rule Matrix" || \
+           "$title" == "Linux Coding-Style Rule Matrix" || \
+           "$title" == "Google Reviewer Rule Matrix" || \
+           "$title" == "OWASP Rule Matrix" ]] && current_matrix_group_enabled=1
+        ;;
+      *)
+        current_matrix_group_enabled=1
+        ;;
+    esac
+  fi
+
+  if [[ "$current_matrix_group_enabled" -eq 1 ]]; then
+    {
+      echo "### ${title}"
+      echo "| Rule ID | Rule | Status | Evidence/Notes | Source |"
+      echo "| --- | --- | --- | --- | --- |"
+    } >> "$rule_matrix_md"
+  else
+    omitted_matrix_groups=$((omitted_matrix_groups + 1))
+  fi
 }
 
 emit_matrix_rule() {
@@ -737,7 +799,9 @@ emit_matrix_rule() {
   local status="$3"
   local note="$4"
   local source_link="$5"
-  printf '| `%s` | %s | `%s` | %s | %s |\n' "$rule_id" "$rule_text" "$status" "$note" "$source_link" >> "$rule_matrix_md"
+  if [[ "$current_matrix_group_enabled" -eq 1 ]]; then
+    printf '| `%s` | %s | `%s` | %s | %s |\n' "$rule_id" "$rule_text" "$status" "$note" "$source_link" >> "$rule_matrix_md"
+  fi
 }
 
 map_checkpatch_rule() {
@@ -776,9 +840,13 @@ checkpatch_inline_total=0
 checkpatch_inline_included=0
 clang_semantic_available=0
 clang_semantic_ran=0
-clang_semantic_warnings=0
-clang_semantic_inline_total=0
+clang_semantic_diag_total=0
 clang_semantic_inline_included=0
+clang_semantic_suppressed=0
+current_topic_group_enabled=1
+current_matrix_group_enabled=1
+omitted_topic_groups=0
+omitted_matrix_groups=0
 detect_style_family() {
   local root="$1"
   local review_text=""
@@ -881,16 +949,16 @@ extract_checkpatch_inline_candidates() {
   local log_file="$1"
   awk '
   BEGIN { sev=""; msg="" }
-  /^ERROR:[[:space:]]*/ {
+  /^ERROR([[:space:]]*[:-])[[:space:]]*/ {
     sev="high"
     msg=$0
-    sub(/^ERROR:[[:space:]]*/, "", msg)
+    sub(/^ERROR([[:space:]]*[:-])[[:space:]]*/, "", msg)
     next
   }
-  /^WARNING:[[:space:]]*/ {
+  /^WARNING([[:space:]]*[:-])[[:space:]]*/ {
     sev="medium"
     msg=$0
-    sub(/^WARNING:[[:space:]]*/, "", msg)
+    sub(/^WARNING([[:space:]]*[:-])[[:space:]]*/, "", msg)
     next
   }
   {
@@ -998,8 +1066,8 @@ if [[ -n "$checkpatch_cmd" ]]; then
     checkpatch_errors="$(printf '%s' "$checkpatch_summary_line" | sed -E 's/.*total:[[:space:]]*([0-9]+) errors?,[[:space:]]*([0-9]+) warnings?.*/\1/')"
     checkpatch_warnings="$(printf '%s' "$checkpatch_summary_line" | sed -E 's/.*total:[[:space:]]*([0-9]+) errors?,[[:space:]]*([0-9]+) warnings?.*/\2/')"
   else
-    checkpatch_errors="$(grep -Eci '(^ERROR:|[[:space:]]ERROR:|[[:space:]]error:)' "$checkpatch_log" || true)"
-    checkpatch_warnings="$(grep -Eci '(^WARNING:|[[:space:]]WARNING:|[[:space:]]warning:)' "$checkpatch_log" || true)"
+    checkpatch_errors="$(grep -Eci '^[[:space:]]*(ERROR|error)(:|[[:space:]]+-)' "$checkpatch_log" || true)"
+    checkpatch_warnings="$(grep -Eci '^[[:space:]]*(WARNING|warning)(:|[[:space:]]+-)' "$checkpatch_log" || true)"
   fi
 
   if [[ "$checkpatch_errors" -gt 0 ]]; then
@@ -1057,20 +1125,22 @@ if [[ "$clang_semantic_available" -eq 1 ]]; then
     done < "$changed_c_files_txt"
 
     awk -v root="$repo_dir/" '
-    match($0, /^([^:]+):([0-9]+):([0-9]+): (warning|error): (.*)$/, m) {
+    match($0, /^([^:]+):([0-9]+):([0-9]+): (warning|error|fatal error): (.*)$/, m) {
       f=m[1]; l=m[2]; c=m[3]; s=m[4]; msg=m[5];
+      if (s == "fatal error") {
+        s = "error";
+      }
       sub("^" root, "", f);
       print f "\t" l "\t" c "\t" s "\t" msg;
     }' "$clang_semantic_log" | sort -u > "$clang_semantic_raw_tsv"
 
     if [[ -s "$clang_semantic_raw_tsv" ]]; then
-      clang_semantic_inline_total="$(wc -l < "$clang_semantic_raw_tsv" | tr -d ' ')"
+      clang_semantic_diag_total="$(wc -l < "$clang_semantic_raw_tsv" | tr -d ' ')"
       while IFS=$'\t' read -r file line col sev msg; do
         [[ -n "$file" && -n "$line" && -n "$msg" ]] || continue
         if ! grep -Fqx "$file" "$changed_c_files_txt"; then
           continue
         fi
-        clang_semantic_warnings=$((clang_semantic_warnings + 1))
 
         if printf '%s' "$msg" | grep -Eqi 'unused parameter'; then
           add_finding "medium" "maintainability" "${file}:${line}" \
@@ -1095,6 +1165,10 @@ if [[ "$clang_semantic_available" -eq 1 ]]; then
           clang_semantic_inline_included=$((clang_semantic_inline_included + 1))
         fi
       done < "$clang_semantic_raw_tsv"
+    fi
+    clang_semantic_suppressed=$((clang_semantic_diag_total - clang_semantic_inline_included))
+    if [[ "$clang_semantic_suppressed" -lt 0 ]]; then
+      clang_semantic_suppressed=0
     fi
   fi
 fi
@@ -1472,6 +1546,7 @@ fi
   echo "- PR-level Comments: ${issue_comments_count}"
   echo "- Reviews: ${reviews_count}"
   echo "- Commits in PR: ${commits_count}"
+  echo "- Cross-Ecosystem Mode: ${cross_ecosystem_mode}"
   echo "- Autonomous Findings: high=${high_count} medium=${medium_count} low=${low_count}"
   echo
   echo "## 2. Changed Files"
@@ -1485,11 +1560,17 @@ fi
   echo
   echo "## 3. Rule Matrices"
   echo "_Per-group rule matrices with explicit source links and status (pass/attention/needs-input)._"
+  if [[ "$cross_ecosystem_mode" == "repo-aware" && "$style_family_detected" != "generic" ]]; then
+    echo "- Repo-aware filtering active for style family: ${style_family_detected} (omitted matrix groups=${omitted_matrix_groups})"
+  fi
   echo "- Matrix coverage: total=${rule_total_count}, pass=${rule_pass_count}, attention=${rule_attention_count}, needs-input=${rule_needs_input_count}"
   cat "$rule_matrix_md"
   echo
   echo "## 4. Research-Derived Review Task Checklist"
   echo "_Actionable checks grouped from Linux/QEMU/Python/Kubernetes/Google/Go/Node/Rust/OWASP review guidance._"
+  if [[ "$cross_ecosystem_mode" == "repo-aware" && "$style_family_detected" != "generic" ]]; then
+    echo "- Repo-aware filtering active for style family: ${style_family_detected} (omitted task groups=${omitted_topic_groups})"
+  fi
   echo "- Task coverage: total=${topic_total_count}, pass=${topic_pass_count}, attention=${topic_attention_count}, needs-input=${topic_needs_input_count}"
   cat "$topic_tasks_md"
   echo
@@ -1543,8 +1624,9 @@ fi
   echo "- Advanced semantic engine (clang) available: $([[ "$clang_semantic_available" -eq 1 ]] && echo yes || echo no)"
   echo "- Advanced semantic engine (clang) ran: $([[ "$clang_semantic_ran" -eq 1 ]] && echo yes || echo no)"
   if [[ "$clang_semantic_ran" -eq 1 ]]; then
-    echo "- clang semantic diagnostics captured: ${clang_semantic_inline_total}"
+    echo "- clang semantic diagnostics captured: ${clang_semantic_diag_total}"
     echo "- clang semantic diagnostics converted to findings/comments: ${clang_semantic_inline_included}"
+    echo "- clang semantic diagnostics suppressed as low-signal/noise: ${clang_semantic_suppressed}"
   fi
   echo "- Kernel-vuln rule pack ran: $([[ "$kernel_vuln_rules_ran" -eq 1 ]] && echo yes || echo no)"
   if [[ "$kernel_vuln_rules_ran" -eq 1 ]]; then

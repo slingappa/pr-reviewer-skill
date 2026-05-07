@@ -1,0 +1,24 @@
+{
+  "version": "2026-05-07",
+  "notes": "Threshold profiles for staged rollout of kernel-vuln rule quality gates.",
+  "profiles": {
+    "seed_baseline": {
+      "min_precision": 0.45,
+      "min_recall": 0.005,
+      "min_f1": 0.01,
+      "description": "Current seed-rule baseline from real-data line benchmark. Use only for bootstrap gating while expanding recall."
+    },
+    "phase2_target": {
+      "min_precision": 0.50,
+      "min_recall": 0.03,
+      "min_f1": 0.055,
+      "description": "Near-term semantic expansion target. Requires improved dataflow/AST and subsystem-specific rules."
+    },
+    "phase3_target": {
+      "min_precision": 0.60,
+      "min_recall": 0.10,
+      "min_f1": 0.17,
+      "description": "Mature gate target intended after iterative rule tuning and false-positive controls."
+    }
+  }
+}

@@ -1,13 +1,15 @@
 ---
 name: pr-reviewer
-description: Review a GitHub pull request using the PR URL and a local checked-out repo path, then generate a concrete `review.md` with prioritized findings, risk notes, validation commands, and reviewer-response workflow.
+description: Review a GitHub pull request using the PR URL and a local checked-out repo path, then generate a concrete `review.md` plus a submittable `review_comments.md` with prioritized findings and ready-to-post draft comments.
 ---
 
 # PR Reviewer
 
 ## Overview
 
-Use this skill to perform a structured PR review from real GitHub data plus local repo context. It fetches PR metadata/files/comments/reviews, correlates with local branch/diff state, and generates an implementation-ready review report (`review.md`) with prioritized findings.
+Use this skill to perform a structured PR review from real GitHub data plus local repo context. It fetches PR metadata/files/comments/reviews, correlates with local branch/diff state, and generates:
+- an implementation-ready full report (`review.md`) with prioritized findings and process evidence
+- a concise, submittable draft-comment file (`review_comments.md`) for human-approved posting
 
 Primary intent: replace human reviewer first-pass by generating autonomous, code-level review findings from patch content. Existing reviewer comments are treated as secondary context by default.
 
@@ -89,7 +91,7 @@ If repo path or PR details are missing, ask for them explicitly.
      - `process`
    - Map each finding to file/line where available.
 
-5. Generate `review.md`
+5. Generate review artifacts (`review.md` and `review_comments.md`)
    - Include PR snapshot and changed-file scope.
    - Include a dedicated per-group **Rule Matrix** section with per-rule status (`pass`/`attention`/`needs-input`) and source links.
    - Include exhaustive research-derived task groups and actionable task checks for all groups listed in `Research Basis Groups`.
@@ -100,6 +102,8 @@ If repo path or PR details are missing, ask for them explicitly.
    - Include open questions and assumptions.
    - Include exact validation commands for local reruns.
    - Include suggested reviewer response workflow.
+   - Generate `review_comments.md` containing only post-ready draft comments (no long matrices/checklists), one comment block per finding with severity and file/line.
+   - Include a compact `Open Questions` subsection in `review_comments.md` for unresolved assumptions that may change comment disposition.
 
 ### Mandatory Gates
 
@@ -133,7 +137,9 @@ If repo path or PR details are missing, ask for them explicitly.
 
 ## Output Contract
 
-When complete, `review.md` must contain:
+When complete, outputs must include:
+
+### A) `review.md` (full report)
 1. PR metadata summary (owner/repo/number/title/base/head)
 2. Actual fetched artifact counts and fetch timestamp
 3. Changed files summary with additions/deletions
@@ -150,11 +156,24 @@ When complete, `review.md` must contain:
    - Each generated draft comment should include the originating rule ID and source link where available.
 11. Reviewer-response workflow (comment/approve/request changes)
 
+### B) `review_comments.md` (submittable draft-only comments)
+1. Short PR header (repo/PR number/title)
+2. One comment block per finding, ordered by severity
+3. Each block must include:
+   - stable comment id (for reviewer tracking)
+   - severity (`HIGH`/`MEDIUM`/`LOW`)
+   - location (file + line)
+   - final draft comment text suitable for direct posting
+4. Keep this file concise: no rule matrix, no large checkpatch logs, no generic checklist noise
+5. Include a one-line human gate reminder: comments are draft-only until reviewer approval
+6. Include `Open Questions` (if any) as short, reviewer-facing prompts tied to specific findings
+
 ## Human Gate for Review Comments
 
 - Any generated review comment text is draft-only by default.
 - Do not auto-submit generated comments to GitHub.
 - A human reviewer must approve/edit each proposed comment before posting.
+- Treat `review_comments.md` as the preferred posting queue for human-approved comments.
 - When checkpatch reports issues, generate file/line draft inline comments from those findings (with cap), and keep full counts visible in the report.
 - Default checkpatch inline cap is unlimited; use `--checkpatch-inline-cap <n>` only when intentionally constraining volume.
 - Group generated comments into submission batches and require human approval per batch before posting.
@@ -187,6 +206,7 @@ scripts/fetch_pr_review_context.sh \
 ```
 
 Use [`scripts/generate_pr_review_report.sh`](scripts/generate_pr_review_report.sh) to generate `review.md`.
+Then generate `review_comments.md` as a concise companion artifact from validated findings (not raw/noisy heuristic output).
 
 Examples:
 ```bash
