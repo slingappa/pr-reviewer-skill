@@ -127,13 +127,13 @@ git -C /abs/path/to/local/repo switch -c pr-<number>-review
   --report-file /abs/path/to/local/repo/review.md
 
 # Optional: run only repo bug-model rules (suppress other review noise)
+# If ml-bug-feature-models is installed, --bug-model/--bug-scorer-cmd are auto-detected.
 ./scripts/generate_pr_review_report.sh \
   --context-dir /tmp/pr-review-<number> \
   --repo-dir /abs/path/to/local/repo \
   --base-ref <base-ref> \
   --head-ref <head-ref> \
   --ruleset repo-bug-model-rules \
-  --bug-model /abs/path/to/bug_risk_pairwise_model.joblib \
   --report-file /abs/path/to/local/repo/review.md
 ```
 
@@ -155,6 +155,9 @@ git -C /abs/path/to/local/repo switch -c pr-<number>-review
 - kernel-vuln historical-rule pack runs automatically when Python is available and contributes additional findings.
 - `--ruleset repo-bug-model-rules` runs only model-driven checks and emits focused `review.md`/`review_comments.md`.
 - Ruleset reference: `references/repo-bug-model-rules.md`.
+- If `ml-bug-feature-models` is installed (`./install.sh` in that repo), this script auto-detects model/scorer from:
+  - `~/.config/pr-reviewer-skill/bug-model.env`, or
+  - `ml-bug-feature-models/current`.
 - Do not auto-submit proposed comments; a human must approve/edit each before posting.
 - Always start by creating a new local branch dedicated to this review task.
 - Do not add `Signed-off-by:` automatically; final signoff must always be done by a human.

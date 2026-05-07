@@ -18,8 +18,8 @@ Options:
   --checkpatch-inline-cap <n> Max checkpatch-derived inline drafts (0 = unlimited; default: 0)
   --comment-batch-size <n> Number of approved comments per submission batch (default: 50)
   --cross-ecosystem-mode <mode> Rule/report breadth: repo-aware|full (default: repo-aware)
-  --bug-model <path>    Path to bug model artifact (pairwise model)
-  --bug-scorer-cmd <cmd> Scorer command prefix (default: ~/git/ml-bug-feature-extractor/install.sh --score-pairwise)
+  --bug-model <path>    Path to bug model artifact (pairwise model). Optional if auto-detected from installed ml-bug-feature-models.
+  --bug-scorer-cmd <cmd> Scorer command prefix. Optional if auto-detected from bundle runtime.
   --bug-binary-threshold <n> Binary risk threshold for model gating (default: 0.45)
   --bug-family-threshold <n> Bug family threshold for model gating (default: 0.35)
   --bug-hunk-threshold <n> Hunk/localization threshold for model gating (default: 0.35)
@@ -327,6 +327,7 @@ bug_model_best_hunk_score="0.0"
 bug_model_hunk_file=""
 bug_model_hunk_line=""
 bug_model_memory_used="false"
+bug_model_source="unset"
 
 # Build changed file rows.
 jq -r '.[] | [(.filename // ""), (.status // ""), ((.additions // 0)|tostring), ((.deletions // 0)|tostring)] | @tsv' "$files_json" | \
@@ -452,6 +453,148 @@ maybe_add_proposed_comment() {
   return 0
 }
 
+strip_optional_quotes() {
+  local value="$1"
+  value="${value%\"}"
+  value="${value#\"}"
+  value="${value%\'}"
+  value="${value#\'}"
+  printf '%s' "$value"
+}
+
+load_bug_model_from_env_file() {
+  local env_file="$1"
+  local env_model=""
+  local env_scorer=""
+  [[ -f "$env_file" ]] || return 1
+
+  env_model="$(sed -n 's/^BUG_MODEL_PATH=//p' "$env_file" | head -n1 || true)"
+  env_scorer="$(sed -n 's/^BUG_SCORER_CMD=//p' "$env_file" | head -n1 || true)"
+  env_model="$(strip_optional_quotes "$env_model")"
+  env_scorer="$(strip_optional_quotes "$env_scorer")"
+
+  if [[ -n "$env_model" && -f "$env_model" ]]; then
+    bug_model_path="$env_model"
+    if [[ -z "$bug_scorer_cmd" && -n "$env_scorer" ]]; then
+      bug_scorer_cmd="$env_scorer"
+    fi
+    bug_model_source="config:${env_file}"
+    return 0
+  fi
+  return 1
+}
+
+resolve_model_from_bundle_dir() {
+  local bundle_dir="$1"
+  local candidate=""
+  [[ -d "$bundle_dir/models" ]] || return 1
+
+  for candidate in "$bundle_dir"/models/bug_risk_pairwise*.joblib "$bundle_dir"/models/*.joblib; do
+    [[ -f "$candidate" ]] || continue
+    bug_model_path="$candidate"
+    if [[ -z "$bug_scorer_cmd" && -x "$bundle_dir/runtime/install.sh" ]]; then
+      bug_scorer_cmd="$bundle_dir/runtime/install.sh --score-pairwise"
+    fi
+    bug_model_source="bundle:${bundle_dir}"
+    return 0
+  done
+
+  return 1
+}
+
+resolve_bug_model_defaults() {
+  local env_file=""
+  local root=""
+  local bundle_dir=""
+
+  if [[ -n "$bug_model_path" ]]; then
+    if [[ -f "$bug_model_path" ]]; then
+      if [[ "$bug_model_source" == "unset" || "$bug_model_source" == "not-found" || "$bug_model_source" == "cli-missing" ]]; then
+        bug_model_source="cli"
+      fi
+      return 0
+    fi
+    bug_model_source="cli-missing"
+    return 1
+  fi
+
+  if [[ -n "${BUG_MODEL_PATH:-}" && -f "${BUG_MODEL_PATH}" ]]; then
+    bug_model_path="${BUG_MODEL_PATH}"
+    if [[ -z "$bug_scorer_cmd" && -n "${BUG_SCORER_CMD:-}" ]]; then
+      bug_scorer_cmd="${BUG_SCORER_CMD}"
+    fi
+    bug_model_source="env:BUG_MODEL_PATH"
+    return 0
+  fi
+
+  for env_file in \
+    "$HOME/.config/pr-reviewer-skill/bug-model.env" \
+    "/local/mnt/workspace/.config/pr-reviewer-skill/bug-model.env"
+  do
+    if load_bug_model_from_env_file "$env_file"; then
+      return 0
+    fi
+  done
+
+  for root in \
+    "/local/mnt/workspace/git/ml-bug-feature-models" \
+    "$HOME/git/ml-bug-feature-models"
+  do
+    [[ -d "$root" ]] || continue
+
+    if [[ -L "$root/current" || -d "$root/current" ]]; then
+      bundle_dir="$(realpath "$root/current" 2>/dev/null || true)"
+      if [[ -n "$bundle_dir" ]] && resolve_model_from_bundle_dir "$bundle_dir"; then
+        return 0
+      fi
+    fi
+
+    bundle_dir="$(find "$root" -maxdepth 2 -type f -name MODEL_INFO.json -printf '%h\n' 2>/dev/null | sort | tail -n1 || true)"
+    if [[ -n "$bundle_dir" ]] && resolve_model_from_bundle_dir "$bundle_dir"; then
+      return 0
+    fi
+  done
+
+  bug_model_source="not-found"
+  return 1
+}
+
+resolve_bug_scorer_cmd() {
+  local model_dir=""
+  local bundle_dir=""
+
+  if [[ -n "$bug_scorer_cmd" ]]; then
+    printf '%s' "$bug_scorer_cmd"
+    return 0
+  fi
+
+  if [[ -n "$bug_model_path" && -f "$bug_model_path" ]]; then
+    model_dir="$(dirname "$bug_model_path")"
+    bundle_dir="$(dirname "$model_dir")"
+    if [[ -x "$bundle_dir/runtime/install.sh" ]]; then
+      printf '%s' "$bundle_dir/runtime/install.sh --score-pairwise"
+      return 0
+    fi
+  fi
+
+  if [[ -n "${BUG_SCORER_CMD:-}" ]]; then
+    printf '%s' "${BUG_SCORER_CMD}"
+    return 0
+  fi
+
+  if [[ -x "/local/mnt/workspace/git/ml-bug-feature-extractor/install.sh" ]]; then
+    printf '%s' "/local/mnt/workspace/git/ml-bug-feature-extractor/install.sh --score-pairwise"
+    return 0
+  fi
+
+  if [[ -x "$HOME/git/ml-bug-feature-extractor/install.sh" ]]; then
+    printf '%s' "$HOME/git/ml-bug-feature-extractor/install.sh --score-pairwise"
+    return 0
+  fi
+
+  return 1
+}
+
 run_repo_bug_model_rules_only() {
   local resolved_cmd=""
   local model_raw=""
@@ -467,18 +610,12 @@ run_repo_bug_model_rules_only() {
     return 0
   fi
 
-  [[ -n "$bug_model_path" ]] || err "--bug-model is required when --ruleset repo-bug-model-rules is used"
+  resolve_bug_model_defaults || true
+  [[ -n "$bug_model_path" ]] || err "No bug model available for --ruleset repo-bug-model-rules. Install ml-bug-feature-models and run its install.sh, or pass --bug-model."
   [[ -f "$bug_model_path" ]] || err "Bug model not found: $bug_model_path"
 
-  if [[ -n "$bug_scorer_cmd" ]]; then
-    resolved_cmd="$bug_scorer_cmd"
-  elif [[ -x "/local/mnt/workspace/git/ml-bug-feature-extractor/install.sh" ]]; then
-    resolved_cmd="/local/mnt/workspace/git/ml-bug-feature-extractor/install.sh --score-pairwise"
-  elif [[ -x "$HOME/git/ml-bug-feature-extractor/install.sh" ]]; then
-    resolved_cmd="$HOME/git/ml-bug-feature-extractor/install.sh --score-pairwise"
-  else
-    err "Unable to resolve scorer command. Pass --bug-scorer-cmd explicitly."
-  fi
+  resolved_cmd="$(resolve_bug_scorer_cmd || true)"
+  [[ -n "$resolved_cmd" ]] || err "Unable to resolve scorer command. Install ml-bug-feature-models, set BUG_SCORER_CMD, or pass --bug-scorer-cmd."
 
   read -r -a scorer_args <<< "$resolved_cmd"
   [[ "${#scorer_args[@]}" -gt 0 ]] || err "Invalid scorer command: $resolved_cmd"
@@ -521,7 +658,7 @@ run_repo_bug_model_rules_only() {
   bug_model_family_score="$(jq -r '.predicted_bug_family_score // 0' "$bug_model_json")"
   bug_model_best_hunk_score="$(jq -r '.best_hunk_score // 0' "$bug_model_json")"
   bug_model_hunk_file="$(jq -r '.hunks_topk[0].file // ""' "$bug_model_json")"
-  bug_model_hunk_line="$(jq -r '.hunks_topk[0].line_start // ""' "$bug_model_json")"
+  bug_model_hunk_line="$(jq -r '.hunks_topk[0].line_hint // .hunks_topk[0].line_start // ""' "$bug_model_json")"
   bug_model_memory_used="$(jq -r '.memory_used // false' "$bug_model_json")"
   predicted_flag="$(jq -r '.predicted_bug_introducing // false' "$bug_model_json")"
   action_text="$(jq -r '.review_comments[0].detail // ""' "$bug_model_json")"
@@ -588,6 +725,7 @@ run_repo_bug_model_rules_only() {
     echo "## 3. repo-bug-model-rules"
     echo "- Model status: ${bug_model_status}"
     echo "- Model path: ${bug_model_path}"
+    echo "- Model source: ${bug_model_source}"
     echo "- Thresholds: binary=${bug_binary_threshold}, family=${bug_family_threshold}, hunk=${bug_hunk_threshold}, topk_hunks=${bug_topk_hunks}"
     echo "- Review mode: ${bug_model_review_mode:-n/a}"
     echo "- Predicted family: ${bug_model_family:-unknown} (score=${bug_model_family_score})"
@@ -640,6 +778,7 @@ run_repo_bug_model_rules_only() {
   exit 0
 }
 
+resolve_bug_model_defaults || true
 run_repo_bug_model_rules_only
 
 # Autonomous findings from patch content (primary signal).
@@ -1226,8 +1365,25 @@ extract_checkpatch_inline_candidates() {
 }
 
 resolve_bug_scorer_cmd() {
+  local model_dir=""
+  local bundle_dir=""
+
   if [[ -n "$bug_scorer_cmd" ]]; then
     printf '%s' "$bug_scorer_cmd"
+    return 0
+  fi
+
+  if [[ -n "$bug_model_path" && -f "$bug_model_path" ]]; then
+    model_dir="$(dirname "$bug_model_path")"
+    bundle_dir="$(dirname "$model_dir")"
+    if [[ -x "$bundle_dir/runtime/install.sh" ]]; then
+      printf '%s' "$bundle_dir/runtime/install.sh --score-pairwise"
+      return 0
+    fi
+  fi
+
+  if [[ -n "${BUG_SCORER_CMD:-}" ]]; then
+    printf '%s' "${BUG_SCORER_CMD}"
     return 0
   fi
 
@@ -1254,6 +1410,10 @@ run_bug_model_signal() {
   local severity="medium"
   local predicted_flag="false"
   local scorer_args=()
+
+  if [[ -z "$bug_model_path" ]]; then
+    resolve_bug_model_defaults || true
+  fi
 
   if [[ -z "$bug_model_path" ]]; then
     bug_model_status="disabled"
@@ -1323,7 +1483,7 @@ run_bug_model_signal() {
   bug_model_family_score="$(jq -r '.predicted_bug_family_score // 0' "$bug_model_json")"
   bug_model_best_hunk_score="$(jq -r '.best_hunk_score // 0' "$bug_model_json")"
   bug_model_hunk_file="$(jq -r '.hunks_topk[0].file // ""' "$bug_model_json")"
-  bug_model_hunk_line="$(jq -r '.hunks_topk[0].line_start // ""' "$bug_model_json")"
+  bug_model_hunk_line="$(jq -r '.hunks_topk[0].line_hint // .hunks_topk[0].line_start // ""' "$bug_model_json")"
   bug_model_memory_used="$(jq -r '.memory_used // false' "$bug_model_json")"
   predicted_flag="$(jq -r '.predicted_bug_introducing // false' "$bug_model_json")"
   action_text="$(jq -r '.review_comments[0].detail // ""' "$bug_model_json")"
@@ -2018,6 +2178,7 @@ fi
   fi
   echo "- Model-assisted bug detector ran: $([[ "$bug_model_ran" -eq 1 ]] && echo yes || echo no)"
   echo "- Model-assisted bug detector status: ${bug_model_status}"
+  echo "- Model source: ${bug_model_source}"
   if [[ "$bug_model_status" == "ok" ]]; then
     echo "- Model artifact: ${bug_model_path}"
     echo "- Model thresholds: binary=${bug_binary_threshold}, family=${bug_family_threshold}, hunk=${bug_hunk_threshold}, topk_hunks=${bug_topk_hunks}"

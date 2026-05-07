@@ -5,7 +5,9 @@ Purpose:
 
 Activation:
 - Pass `--ruleset repo-bug-model-rules` to `scripts/generate_pr_review_report.sh`.
-- Requires `--bug-model <path>` (pairwise model artifact).
+- Model path can be supplied with `--bug-model <path>`, or auto-detected from:
+  - `~/.config/pr-reviewer-skill/bug-model.env`
+  - `ml-bug-feature-models/current` bundle layout.
 
 Behavior:
 1. Scores the target patch/commit using the configured bug scorer.

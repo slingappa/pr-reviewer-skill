@@ -270,13 +270,13 @@ scripts/generate_pr_review_report.sh \
   --output /tmp/pr-review-123/review.md
 
 # Optional: evaluate only repo bug-model rules (suppress other noise)
+# If ml-bug-feature-models is installed, --bug-model/--bug-scorer-cmd are auto-detected.
 scripts/generate_pr_review_report.sh \
   --context-dir /tmp/pr-review-123 \
   --repo-dir /path/to/repo \
   --base-ref <base-ref> \
   --head-ref <head-ref> \
   --ruleset repo-bug-model-rules \
-  --bug-model /path/to/bug_risk_pairwise_model.joblib \
   --output /tmp/pr-review-123/review.md
 
 # Overwrite repo review.md
@@ -288,6 +288,9 @@ scripts/generate_pr_review_report.sh \
 
 Rule reference for bug-model-only mode:
 - [`references/repo-bug-model-rules.md`](references/repo-bug-model-rules.md)
+- Auto-detection sources for installed model bundles:
+  - `~/.config/pr-reviewer-skill/bug-model.env`
+  - `ml-bug-feature-models/current`
 
 Vulnerability-rule lifecycle scripts:
 ```bash
