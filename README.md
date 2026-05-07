@@ -15,6 +15,24 @@ The skill helps you:
 
 The review-topic model is based on patterns seen in Linux/QEMU/EDK2/U-Boot plus generic practices from popular multi-language ecosystems (Go, Python, Kubernetes, Node.js, and Google code review guidance).
 
+The skill now enforces explicit grouped task checks from:
+- Linux kernel submission checklist/process
+- QEMU submitting patches workflow
+- Python core PR acceptance workflow
+- Kubernetes PR/review process
+- Google code review standard
+- Go code review comments
+- Node.js PR responsibilities/workflow
+- Rust API guideline checklist mindset
+- OWASP secure code review framing
+
+Each task is marked as `pass`, `attention`, or `needs-input`.
+It also emits dedicated per-group **Rule Matrices** with source links for each rule.
+
+Deep-crawl reference catalog:
+- [`references/research_task_catalog.md`](references/research_task_catalog.md)
+- This file contains expanded sublink-derived checks per source group and is used to avoid shallow topic coverage.
+
 ## Repository layout
 
 - `install.sh`: installer for the skill
@@ -103,9 +121,16 @@ git -C /abs/path/to/local/repo switch -c pr-<number>-review
 
 - If GitHub API rate-limit/auth blocks fetch, export `GITHUB_TOKEN` or pass `--token`.
 - Checkpatch command is auto-detected in common locations (`scripts/checkpatch.pl`, `BaseTools/Scripts/PatchCheck.py`).
+- If checker is not in target repo, skill infers style family and fetches appropriate checker from internet (Linux `checkpatch.pl` or EDK2 `PatchCheck.py`).
+- If family inference is ambiguous, report includes a hint to pass `--style-family` or `--checkpatch-cmd`.
+- Base ref auto-selection prefers upstream target first when available (`upstream/<base>` before `origin/<base>`), reducing fork-remote scope mismatches.
 - Generator is strict by default:
 - local diff scope must match fetched PR files (override with `--allow-scope-mismatch`)
 - checkpatch is optional and reported when detected/provided
+- `review.md` now includes a "Proposed Review Comments (Human Approval Required)" section with draft line comments generated from autonomous findings.
+- Draft review comments include rule IDs/source links where mapping is available.
+- checkpatch warnings/errors are converted into file/line draft inline comments (capped) so they are review-ready instead of only summarized.
+- Do not auto-submit proposed comments; a human must approve/edit each before posting.
 - Always start by creating a new local branch dedicated to this review task.
 - Do not add `Signed-off-by:` automatically; final signoff must always be done by a human.
 - The report is signal-driven; it should be combined with manual code reasoning before final approval.

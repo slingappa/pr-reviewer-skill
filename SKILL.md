@@ -1,0 +1,208 @@
+---
+name: pr-reviewer
+description: Review a GitHub pull request using the PR URL and a local checked-out repo path, then generate a concrete `review.md` with prioritized findings, risk notes, validation commands, and reviewer-response workflow.
+---
+
+# PR Reviewer
+
+## Overview
+
+Use this skill to perform a structured PR review from real GitHub data plus local repo context. It fetches PR metadata/files/comments/reviews, correlates with local branch/diff state, and generates an implementation-ready review report (`review.md`) with prioritized findings.
+
+Primary intent: replace human reviewer first-pass by generating autonomous, code-level review findings from patch content. Existing reviewer comments are treated as secondary context by default.
+
+Topic model is intentionally broad and cross-repo, inspired by common review expectations seen in large OSS ecosystems (for example kernel/hypervisor/firmware plus mainstream multi-language repositories).
+Baseline references include Linux/QEMU/EDK2/U-Boot style-process guidance and generic review practices from ecosystems like Go, Python, Kubernetes, Node.js, and Google engineering review docs.
+
+## Research Basis Groups
+
+Treat each source below as a distinct review-task group with actionable checks:
+1. Linux kernel submission checklist/process checks
+2. QEMU submitting-a-patch workflow expectations
+3. Python core PR acceptance/check workflow
+4. Kubernetes PR/review process practices
+5. Google code review standard (code health)
+6. Go code review comments norms
+7. Node.js PR/review workflow responsibilities
+8. Rust API guideline checklist mindset
+9. OWASP secure code review framing
+
+For every run, produce explicit per-group tasks with status:
+- `pass`: evidence exists in patch/context
+- `attention`: likely gap or risk from available signals
+- `needs-input`: cannot be proven from local/PR data; requires human confirmation
+
+Deep-crawl task catalog:
+- [`references/research_task_catalog.md`](references/research_task_catalog.md)
+- This catalog is mandatory input for topic-group checks and should be kept in sync with upstream guidance changes.
+
+## Required Inputs
+
+Request these inputs before starting review:
+1. Local repo folder path (checked-out repository)
+2. PR details
+   - Preferred: full PR URL
+   - Acceptable fallback: owner/repo + PR number
+
+Optional but recommended:
+3. GitHub token (for private repos or rate-limit resilience)
+4. Base/head refs if local branch naming does not match remote defaults
+5. Explicit checkpatch command if repo uses a non-standard checker path
+
+If repo path or PR details are missing, ask for them explicitly.
+
+## Workflow
+
+1. Create a dedicated working branch first (mandatory)
+   - Before any fetch/review/edit actions, create and switch to a new local branch.
+   - Suggested naming: `pr-<number>-review` or `review/<owner>-<repo>-pr-<number>`.
+   - Keep the branch focused on the current PR review task only.
+
+2. Enter repo and validate context
+   - Confirm repo exists and `.git` is present.
+   - Capture branch, remotes, and worktree status.
+
+3. Fetch actual PR review context from GitHub API
+   - `GET /repos/{owner}/{repo}/pulls/{number}`
+   - `GET /repos/{owner}/{repo}/pulls/{number}/files`
+   - `GET /repos/{owner}/{repo}/pulls/{number}/comments`
+   - `GET /repos/{owner}/{repo}/issues/{number}/comments`
+   - `GET /repos/{owner}/{repo}/pulls/{number}/reviews`
+   - `GET /repos/{owner}/{repo}/pulls/{number}/commits`
+
+4. Build review findings
+   - Prioritize autonomous findings from patch content and local validation first.
+   - Prioritize by severity:
+     - `high`: blocking correctness/regression/release risk
+     - `medium`: likely bug/maintainability/testing gap
+     - `low`: style/docs/minor polish
+   - Classify each finding:
+     - `correctness`
+     - `testing-gap`
+     - `maintainability`
+     - `process`
+   - Map each finding to file/line where available.
+
+5. Generate `review.md`
+   - Include PR snapshot and changed-file scope.
+   - Include a dedicated per-group **Rule Matrix** section with per-rule status (`pass`/`attention`/`needs-input`) and source links.
+   - Include exhaustive research-derived task groups and actionable task checks for all groups listed in `Research Basis Groups`.
+   - Ensure each group includes sublink-derived checks from `references/research_task_catalog.md` (not only top-level summary checks).
+   - Include autonomous findings ordered by severity.
+   - Include existing reviewer comments as context only (not primary findings).
+   - Include checkpatch command used and warning/error summary.
+   - Include open questions and assumptions.
+   - Include exact validation commands for local reruns.
+   - Include suggested reviewer response workflow.
+
+### Mandatory Gates
+
+- PR scope gate (default strict): local diff file set (`base...head`) must match fetched GitHub PR file set.
+- Checkpatch is optional by default for cross-repo compatibility. If available, run and report it.
+- Checker resolution order:
+  - use checker in target repo if present
+  - infer style family from repo + patch/review signals
+  - fetch corresponding checker from internet when family is confident
+  - if family is ambiguous, request user hint (`--style-family` or `--checkpatch-cmd`)
+- Base ref auto-resolution order (when `--base-ref` is omitted):
+  - `upstream/<pr-base-branch>`
+  - `origin/<pr-base-branch>`
+  - `<pr-base-branch>`
+  - common fallbacks: `upstream/main`, `upstream/master`, `origin/main`, `origin/master`, `main`, `master`
+- Override flags only when intentionally needed:
+  - `--allow-scope-mismatch`
+
+6. Keep output action-oriented
+   - Each finding must include:
+     - location
+     - evidence/source
+     - risk statement
+     - recommended action
+
+## Commit and Signoff Policy
+
+- Never add `Signed-off-by:` trailers automatically in any commit message.
+- Never use `git commit --signoff` while operating this skill.
+- If signoff is required by project policy, leave it to a human to add final signoff manually.
+
+## Output Contract
+
+When complete, `review.md` must contain:
+1. PR metadata summary (owner/repo/number/title/base/head)
+2. Actual fetched artifact counts and fetch timestamp
+3. Changed files summary with additions/deletions
+4. Extensive review-topic coverage section
+   - Must include all 9 research basis groups and multiple actionable tasks per group.
+   - Must mark each task as `pass` / `attention` / `needs-input`.
+   - Must include per-group rule matrices with exact source links.
+5. Prioritized findings with file references
+6. Existing reviewer context section (secondary signal)
+7. Open questions / assumptions
+8. Validation commands for local rerun
+9. Checkpatch results section (command, mode, warnings/errors, snippet)
+10. Proposed review comments section (draft only, human-approval required)
+   - Each generated draft comment should include the originating rule ID and source link where available.
+11. Reviewer-response workflow (comment/approve/request changes)
+
+## Human Gate for Review Comments
+
+- Any generated review comment text is draft-only by default.
+- Do not auto-submit generated comments to GitHub.
+- A human reviewer must approve/edit each proposed comment before posting.
+- When checkpatch reports issues, generate file/line draft inline comments from those findings (with cap), and keep full counts visible in the report.
+
+## Command Patterns
+
+Use one of these:
+1. `curl` + GitHub REST API
+2. `gh api` / `gh pr view` if authenticated
+
+Use `jq` to normalize JSON into concise tables.
+
+## Bundled Scripts
+
+Use [`scripts/fetch_pr_review_context.sh`](scripts/fetch_pr_review_context.sh) to fetch PR artifacts.
+
+Examples:
+```bash
+# Using PR URL
+scripts/fetch_pr_review_context.sh \
+  --pr-url https://github.com/org/repo/pull/123 \
+  --out-dir /tmp/pr-review-123
+
+# Using owner/repo/number
+scripts/fetch_pr_review_context.sh \
+  --owner org \
+  --repo repo \
+  --pr 123 \
+  --out-dir /tmp/pr-review-123
+```
+
+Use [`scripts/generate_pr_review_report.sh`](scripts/generate_pr_review_report.sh) to generate `review.md`.
+
+Examples:
+```bash
+# Print report to stdout
+scripts/generate_pr_review_report.sh \
+  --context-dir /tmp/pr-review-123 \
+  --repo-dir /path/to/repo
+
+# Write report file
+scripts/generate_pr_review_report.sh \
+  --context-dir /tmp/pr-review-123 \
+  --repo-dir /path/to/repo \
+  --output /tmp/pr-review-123/review.md
+
+# Optional: add explicit checkpatch command when repo has one
+scripts/generate_pr_review_report.sh \
+  --context-dir /tmp/pr-review-123 \
+  --repo-dir /path/to/repo \
+  --checkpatch-cmd "./scripts/checkpatch.pl --no-tree" \
+  --output /tmp/pr-review-123/review.md
+
+# Overwrite repo review.md
+scripts/generate_pr_review_report.sh \
+  --context-dir /tmp/pr-review-123 \
+  --repo-dir /path/to/repo \
+  --report-file /path/to/repo/review.md
+```
