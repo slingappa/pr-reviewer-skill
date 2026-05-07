@@ -125,6 +125,16 @@ git -C /abs/path/to/local/repo switch -c pr-<number>-review
   --repo-dir /abs/path/to/local/repo \
   --checkpatch-cmd "./scripts/checkpatch.pl --no-tree" \
   --report-file /abs/path/to/local/repo/review.md
+
+# Optional: run only repo bug-model rules (suppress other review noise)
+./scripts/generate_pr_review_report.sh \
+  --context-dir /tmp/pr-review-<number> \
+  --repo-dir /abs/path/to/local/repo \
+  --base-ref <base-ref> \
+  --head-ref <head-ref> \
+  --ruleset repo-bug-model-rules \
+  --bug-model /abs/path/to/bug_risk_pairwise_model.joblib \
+  --report-file /abs/path/to/local/repo/review.md
 ```
 
 ## Notes
@@ -143,6 +153,8 @@ git -C /abs/path/to/local/repo switch -c pr-<number>-review
 - checkpatch-derived draft comment cap defaults to unlimited; override with `--checkpatch-inline-cap <n>`.
 - comment submission batches are planned in report section 11; tune with `--comment-batch-size <n>`.
 - kernel-vuln historical-rule pack runs automatically when Python is available and contributes additional findings.
+- `--ruleset repo-bug-model-rules` runs only model-driven checks and emits focused `review.md`/`review_comments.md`.
+- Ruleset reference: `references/repo-bug-model-rules.md`.
 - Do not auto-submit proposed comments; a human must approve/edit each before posting.
 - Always start by creating a new local branch dedicated to this review task.
 - Do not add `Signed-off-by:` automatically; final signoff must always be done by a human.

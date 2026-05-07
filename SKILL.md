@@ -15,6 +15,7 @@ Primary intent: replace human reviewer first-pass by generating autonomous, code
 
 Topic model is intentionally broad and cross-repo, inspired by common review expectations seen in large OSS ecosystems (for example kernel/hypervisor/firmware plus mainstream multi-language repositories).
 Baseline references include Linux/QEMU/EDK2/U-Boot style-process guidance and generic review practices from ecosystems like Go, Python, Kubernetes, Node.js, and Google engineering review docs.
+The skill must remain generic: avoid repo-specific assumptions and derive checks from observed repo language/tooling plus PR evidence.
 
 ## Research Basis Groups
 
@@ -59,6 +60,15 @@ Optional but recommended:
 
 If repo path or PR details are missing, ask for them explicitly.
 
+## Unattended Hardening Defaults
+
+- Default to fully unattended execution once mandatory inputs are present.
+- Ask the user only when a mandatory gate cannot be satisfied from local or fetched data.
+- Ask at most one concise blocking question at a time, with the exact missing datum.
+- Never fabricate uncertain facts; mark as `needs-input` when evidence cannot be established.
+- Keep a short run log in the report: what was fetched, what was inferred, what was validated, and what remains uncertain.
+- Never leak secrets in logs or artifacts (tokens, cookies, private URLs with credentials).
+
 ## Workflow
 
 1. Create a dedicated working branch first (mandatory)
@@ -69,6 +79,7 @@ If repo path or PR details are missing, ask for them explicitly.
 2. Enter repo and validate context
    - Confirm repo exists and `.git` is present.
    - Capture branch, remotes, and worktree status.
+   - Verify PR owner/repo matches at least one configured remote (or clearly document mismatch).
 
 3. Fetch actual PR review context from GitHub API
    - `GET /repos/{owner}/{repo}/pulls/{number}`
@@ -77,6 +88,9 @@ If repo path or PR details are missing, ask for them explicitly.
    - `GET /repos/{owner}/{repo}/issues/{number}/comments`
    - `GET /repos/{owner}/{repo}/pulls/{number}/reviews`
    - `GET /repos/{owner}/{repo}/pulls/{number}/commits`
+   - Handle pagination for all list endpoints until completion.
+   - Retry transient API/network failures with bounded backoff before declaring failure.
+   - Record fetch counts per endpoint and note if any endpoint response is partial or unavailable.
 
 4. Build review findings
    - Prioritize autonomous findings from patch content and local validation first.
@@ -90,6 +104,9 @@ If repo path or PR details are missing, ask for them explicitly.
      - `maintainability`
      - `process`
    - Map each finding to file/line where available.
+   - For `high` and `medium` findings, require explicit evidence (diff snippet, API metadata, or local command output).
+   - Merge duplicate findings that point to the same root cause.
+   - Avoid low-value noise: style-only comments should be emitted only when backed by project policy/checker output.
 
 5. Generate review artifacts (`review.md` and `review_comments.md`)
    - Include PR snapshot and changed-file scope.
@@ -107,7 +124,15 @@ If repo path or PR details are missing, ask for them explicitly.
 
 ### Mandatory Gates
 
+- Input gate: repo path and PR identity must be present and parseable.
+- Identity gate: fetched PR owner/repo must match intended local repo or be explicitly flagged as mismatch.
+- Fetch completeness gate: required PR endpoints must be fetched successfully, including pagination.
 - PR scope gate (default strict): local diff file set (`base...head`) must match fetched GitHub PR file set.
+- Diff fidelity gate: verify local base/head resolution uses merge-base semantics; document exact refs used.
+- Large/binary coverage gate: if GitHub omits patch text for files, mark limitation and use local `git diff` where possible.
+- Evidence gate: every `high` or `medium` finding must include concrete evidence and a falsifiable risk statement.
+- Uncertainty gate: uncertain claims must be downgraded to `needs-input` (never presented as confirmed defects).
+- Draft-comment gate: generated comments must be deduplicated and directly actionable.
 - Checkpatch is optional by default for cross-repo compatibility. If available, run and report it.
 - Checker resolution order:
   - use checker in target repo if present
@@ -121,6 +146,13 @@ If repo path or PR details are missing, ask for them explicitly.
   - common fallbacks: `upstream/main`, `upstream/master`, `origin/main`, `origin/master`, `main`, `master`
 - Override flags only when intentionally needed:
   - `--allow-scope-mismatch`
+
+### Autonomous Fallback Order
+
+- If strict scope gate fails, auto-fetch/update refs and recompute once before escalating.
+- If checker discovery fails, continue semantic review and mark checker status as `needs-input` instead of aborting.
+- If remote data is rate-limited or partially unavailable, continue with available evidence and clearly label confidence.
+- Abort only when mandatory inputs are missing or PR identity cannot be resolved.
 
 6. Keep output action-oriented
    - Each finding must include:
@@ -148,6 +180,7 @@ When complete, outputs must include:
    - Must mark each task as `pass` / `attention` / `needs-input`.
    - Must include per-group rule matrices with exact source links.
 5. Prioritized findings with file references
+   - Include confidence level (`high`/`medium`/`low`) for each finding.
 6. Existing reviewer context section (secondary signal)
 7. Open questions / assumptions
 8. Validation commands for local rerun
@@ -160,7 +193,7 @@ When complete, outputs must include:
 1. Short PR header (repo/PR number/title)
 2. One comment block per finding, ordered by severity
 3. Each block must include:
-   - stable comment id (for reviewer tracking)
+   - stable comment id (for reviewer tracking, deterministic from file+line+category+summary hash)
    - severity (`HIGH`/`MEDIUM`/`LOW`)
    - location (file + line)
    - final draft comment text suitable for direct posting
@@ -236,12 +269,25 @@ scripts/generate_pr_review_report.sh \
   --checkpatch-inline-cap 0 \
   --output /tmp/pr-review-123/review.md
 
+# Optional: evaluate only repo bug-model rules (suppress other noise)
+scripts/generate_pr_review_report.sh \
+  --context-dir /tmp/pr-review-123 \
+  --repo-dir /path/to/repo \
+  --base-ref <base-ref> \
+  --head-ref <head-ref> \
+  --ruleset repo-bug-model-rules \
+  --bug-model /path/to/bug_risk_pairwise_model.joblib \
+  --output /tmp/pr-review-123/review.md
+
 # Overwrite repo review.md
 scripts/generate_pr_review_report.sh \
   --context-dir /tmp/pr-review-123 \
   --repo-dir /path/to/repo \
   --report-file /path/to/repo/review.md
 ```
+
+Rule reference for bug-model-only mode:
+- [`references/repo-bug-model-rules.md`](references/repo-bug-model-rules.md)
 
 Vulnerability-rule lifecycle scripts:
 ```bash

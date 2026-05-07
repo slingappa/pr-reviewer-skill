@@ -18,6 +18,13 @@ Options:
   --checkpatch-inline-cap <n> Max checkpatch-derived inline drafts (0 = unlimited; default: 0)
   --comment-batch-size <n> Number of approved comments per submission batch (default: 50)
   --cross-ecosystem-mode <mode> Rule/report breadth: repo-aware|full (default: repo-aware)
+  --bug-model <path>    Path to bug model artifact (pairwise model)
+  --bug-scorer-cmd <cmd> Scorer command prefix (default: ~/git/ml-bug-feature-extractor/install.sh --score-pairwise)
+  --bug-binary-threshold <n> Binary risk threshold for model gating (default: 0.45)
+  --bug-family-threshold <n> Bug family threshold for model gating (default: 0.35)
+  --bug-hunk-threshold <n> Hunk/localization threshold for model gating (default: 0.35)
+  --bug-topk-hunks <n>  Number of top hunks to request from model scorer (default: 5)
+  --ruleset <name>      Rule selection: all|repo-bug-model-rules (default: all)
   --no-fetch-checkpatch Disable remote fetch fallback when local checker is missing
   --allow-scope-mismatch Do not fail when local diff file set differs from GitHub PR file set
   --output <file>       Write report to file (default: stdout)
@@ -46,6 +53,13 @@ fetch_checkpatch=1
 checkpatch_inline_cap=0
 comment_batch_size=50
 cross_ecosystem_mode="repo-aware"
+bug_model_path=""
+bug_scorer_cmd=""
+bug_binary_threshold="0.45"
+bug_family_threshold="0.35"
+bug_hunk_threshold="0.35"
+bug_topk_hunks=5
+ruleset_mode="all"
 allow_scope_mismatch=0
 output_file=""
 report_file=""
@@ -87,6 +101,34 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cross-ecosystem-mode)
       cross_ecosystem_mode="${2:-repo-aware}"
+      shift 2
+      ;;
+    --bug-model)
+      bug_model_path="${2:-}"
+      shift 2
+      ;;
+    --bug-scorer-cmd)
+      bug_scorer_cmd="${2:-}"
+      shift 2
+      ;;
+    --bug-binary-threshold)
+      bug_binary_threshold="${2:-0.45}"
+      shift 2
+      ;;
+    --bug-family-threshold)
+      bug_family_threshold="${2:-0.35}"
+      shift 2
+      ;;
+    --bug-hunk-threshold)
+      bug_hunk_threshold="${2:-0.35}"
+      shift 2
+      ;;
+    --bug-topk-hunks)
+      bug_topk_hunks="${2:-5}"
+      shift 2
+      ;;
+    --ruleset)
+      ruleset_mode="${2:-all}"
       shift 2
       ;;
     --no-fetch-checkpatch)
@@ -138,6 +180,15 @@ esac
 case "$cross_ecosystem_mode" in
   repo-aware|full) ;;
   *) err "Invalid --cross-ecosystem-mode: $cross_ecosystem_mode (use repo-aware|full)" ;;
+esac
+[[ "$bug_topk_hunks" =~ ^[0-9]+$ ]] || err "Invalid --bug-topk-hunks: $bug_topk_hunks (use integer >= 1)"
+[[ "$bug_topk_hunks" -ge 1 ]] || err "Invalid --bug-topk-hunks: $bug_topk_hunks (use integer >= 1)"
+[[ "$bug_binary_threshold" =~ ^[0-9]+(\.[0-9]+)?$ ]] || err "Invalid --bug-binary-threshold: $bug_binary_threshold"
+[[ "$bug_family_threshold" =~ ^[0-9]+(\.[0-9]+)?$ ]] || err "Invalid --bug-family-threshold: $bug_family_threshold"
+[[ "$bug_hunk_threshold" =~ ^[0-9]+(\.[0-9]+)?$ ]] || err "Invalid --bug-hunk-threshold: $bug_hunk_threshold"
+case "$ruleset_mode" in
+  all|repo-bug-model-rules) ;;
+  *) err "Invalid --ruleset: $ruleset_mode (use all|repo-bug-model-rules)" ;;
 esac
 
 pr_json="$context_dir/pr.json"
@@ -237,6 +288,8 @@ kernel_vuln_log="$tmp_dir/kernel_vuln.log"
 added_lines_tsv="$tmp_dir/added_lines.tsv"
 pr_files_txt="$tmp_dir/pr_files.txt"
 local_files_txt="$tmp_dir/local_files.txt"
+bug_model_json="$tmp_dir/bug_model.json"
+review_comments_md="$tmp_dir/review_comments.md"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 : > "$findings_md"
@@ -259,9 +312,21 @@ trap 'rm -rf "$tmp_dir"' EXIT
 : > "$added_lines_tsv"
 : > "$pr_files_txt"
 : > "$local_files_txt"
+: > "$bug_model_json"
+: > "$review_comments_md"
 
 kernel_vuln_rules_ran=0
 kernel_vuln_findings_total=0
+bug_model_ran=0
+bug_model_status="not-run"
+bug_model_review_mode=""
+bug_model_risk_score="0.0"
+bug_model_family=""
+bug_model_family_score="0.0"
+bug_model_best_hunk_score="0.0"
+bug_model_hunk_file=""
+bug_model_hunk_line=""
+bug_model_memory_used="false"
 
 # Build changed file rows.
 jq -r '.[] | [(.filename // ""), (.status // ""), ((.additions // 0)|tostring), ((.deletions // 0)|tostring)] | @tsv' "$files_json" | \
@@ -386,6 +451,196 @@ maybe_add_proposed_comment() {
   printf '%s\t%s\t%s\t%s\n' "$severity" "$file" "$line" "$msg" >> "$proposed_comments_tsv"
   return 0
 }
+
+run_repo_bug_model_rules_only() {
+  local resolved_cmd=""
+  local model_raw=""
+  local model_json_payload=""
+  local single_commit=""
+  local location_text="model-scorer"
+  local action_text=""
+  local predicted_flag="false"
+  local scorer_args=()
+  local review_comments_out="$context_dir/review_comments.md"
+
+  if [[ "$ruleset_mode" != "repo-bug-model-rules" ]]; then
+    return 0
+  fi
+
+  [[ -n "$bug_model_path" ]] || err "--bug-model is required when --ruleset repo-bug-model-rules is used"
+  [[ -f "$bug_model_path" ]] || err "Bug model not found: $bug_model_path"
+
+  if [[ -n "$bug_scorer_cmd" ]]; then
+    resolved_cmd="$bug_scorer_cmd"
+  elif [[ -x "/local/mnt/workspace/git/ml-bug-feature-extractor/install.sh" ]]; then
+    resolved_cmd="/local/mnt/workspace/git/ml-bug-feature-extractor/install.sh --score-pairwise"
+  elif [[ -x "$HOME/git/ml-bug-feature-extractor/install.sh" ]]; then
+    resolved_cmd="$HOME/git/ml-bug-feature-extractor/install.sh --score-pairwise"
+  else
+    err "Unable to resolve scorer command. Pass --bug-scorer-cmd explicitly."
+  fi
+
+  read -r -a scorer_args <<< "$resolved_cmd"
+  [[ "${#scorer_args[@]}" -gt 0 ]] || err "Invalid scorer command: $resolved_cmd"
+
+  single_commit="$(jq -r 'if length==1 then .[0].sha // "" else "" end' "$commits_json")"
+  if [[ -n "$single_commit" ]]; then
+    model_raw="$("${scorer_args[@]}" \
+      --model "$bug_model_path" \
+      --repo "$repo_dir" \
+      --mode head \
+      --commit "$single_commit" \
+      --binary-threshold "$bug_binary_threshold" \
+      --family-threshold "$bug_family_threshold" \
+      --hunk-threshold "$bug_hunk_threshold" \
+      --topk-hunks "$bug_topk_hunks" \
+      --json 2>>"$kernel_vuln_log" || true)"
+  else
+    model_raw="$("${scorer_args[@]}" \
+      --model "$bug_model_path" \
+      --repo "$repo_dir" \
+      --mode range \
+      --range "$base_ref..$head_ref" \
+      --binary-threshold "$bug_binary_threshold" \
+      --family-threshold "$bug_family_threshold" \
+      --hunk-threshold "$bug_hunk_threshold" \
+      --topk-hunks "$bug_topk_hunks" \
+      --json 2>>"$kernel_vuln_log" || true)"
+  fi
+
+  model_json_payload="$(printf '%s\n' "$model_raw" | sed -n '/^{/,$p')"
+  [[ -n "$model_json_payload" ]] || err "Model scorer returned empty output"
+  printf '%s\n' "$model_json_payload" > "$bug_model_json"
+  jq -e . "$bug_model_json" >/dev/null 2>&1 || err "Model scorer returned invalid JSON"
+
+  bug_model_ran=1
+  bug_model_status="ok"
+  bug_model_risk_score="$(jq -r '.bug_risk_score // 0' "$bug_model_json")"
+  bug_model_review_mode="$(jq -r '.review_mode // ""' "$bug_model_json")"
+  bug_model_family="$(jq -r '.predicted_bug_family // ""' "$bug_model_json")"
+  bug_model_family_score="$(jq -r '.predicted_bug_family_score // 0' "$bug_model_json")"
+  bug_model_best_hunk_score="$(jq -r '.best_hunk_score // 0' "$bug_model_json")"
+  bug_model_hunk_file="$(jq -r '.hunks_topk[0].file // ""' "$bug_model_json")"
+  bug_model_hunk_line="$(jq -r '.hunks_topk[0].line_start // ""' "$bug_model_json")"
+  bug_model_memory_used="$(jq -r '.memory_used // false' "$bug_model_json")"
+  predicted_flag="$(jq -r '.predicted_bug_introducing // false' "$bug_model_json")"
+  action_text="$(jq -r '.review_comments[0].detail // ""' "$bug_model_json")"
+  if [[ -z "$action_text" ]]; then
+    action_text="Run focused manual validation on top-ranked hunk and verify bug-family invariants."
+  fi
+
+  if [[ -n "$bug_model_hunk_file" && "$bug_model_hunk_line" =~ ^[0-9]+$ ]]; then
+    location_text="${bug_model_hunk_file}:${bug_model_hunk_line}"
+  fi
+
+  if [[ "$predicted_flag" == "true" && "$bug_model_review_mode" == "actual-bug" && -n "$bug_model_family" ]]; then
+    add_finding "high" "correctness" "$location_text" \
+      "Model-assisted detector predicts ${bug_model_family} (risk=${bug_model_risk_score}, family=${bug_model_family_score}, hunk=${bug_model_best_hunk_score}, mode=${bug_model_review_mode}, memory_used=${bug_model_memory_used})." \
+      "Likely ${bug_model_family} defect in this patch." \
+      "$action_text" \
+      "REPO-BUG-MODEL-RULE-1" "references/repo-bug-model-rules.md"
+  elif [[ "$predicted_flag" == "true" ]]; then
+    add_finding "medium" "correctness" "model-scorer" \
+      "Model-assisted detector raised risk signal (risk=${bug_model_risk_score}, family=${bug_model_family:-unknown}, mode=${bug_model_review_mode})." \
+      "Patch appears bug-prone but full family/localization gate did not pass." \
+      "$action_text" \
+      "REPO-BUG-MODEL-RULE-2" "references/repo-bug-model-rules.md"
+  else
+    add_finding "low" "process" "model-scorer" \
+      "Model-assisted detector did not raise an actual-bug signal (risk=${bug_model_risk_score}, family=${bug_model_family:-unknown}, mode=${bug_model_review_mode:-n/a})." \
+      "No strong model signal; manual review remains required." \
+      "Treat this as informational only and continue standard review." \
+      "REPO-BUG-MODEL-RULE-3" "references/repo-bug-model-rules.md"
+  fi
+
+  {
+    high_count="$(grep -Ec '^### F[0-9]+ - HIGH - ' "$findings_md" || true)"
+    medium_count="$(grep -Ec '^### F[0-9]+ - MEDIUM - ' "$findings_md" || true)"
+    low_count="$(grep -Ec '^### F[0-9]+ - LOW - ' "$findings_md" || true)"
+    echo "# PR Review Report"
+    echo
+    if [[ -n "$pr_url" ]]; then
+      echo "PR: ${pr_url}"
+    elif [[ -n "$owner" && -n "$repo" && -n "$pr_number" ]]; then
+      echo "PR: https://github.com/${owner}/${repo}/pull/${pr_number}"
+    fi
+    echo "Fetched at (UTC): ${fetched_at}"
+    echo
+    echo "## 1. Snapshot"
+    echo "- Owner/Repo: ${owner}/${repo}"
+    echo "- PR Number: ${pr_number}"
+    echo "- Title: ${pr_title}"
+    echo "- Base Branch: ${base_branch}"
+    echo "- Head Branch: ${head_branch}"
+    echo "- Local Diff Base/Head: ${base_ref}...${head_ref}"
+    echo "- Ruleset mode: ${ruleset_mode}"
+    echo "- Autonomous Findings: high=${high_count} medium=${medium_count} low=${low_count}"
+    echo
+    echo "## 2. Changed Files"
+    echo "| File | Status | + | - |"
+    echo "| --- | --- | --- | --- |"
+    if [[ -s "$files_rows_md" ]]; then
+      cat "$files_rows_md"
+    else
+      echo "| (none) | - | - | - |"
+    fi
+    echo
+    echo "## 3. repo-bug-model-rules"
+    echo "- Model status: ${bug_model_status}"
+    echo "- Model path: ${bug_model_path}"
+    echo "- Thresholds: binary=${bug_binary_threshold}, family=${bug_family_threshold}, hunk=${bug_hunk_threshold}, topk_hunks=${bug_topk_hunks}"
+    echo "- Review mode: ${bug_model_review_mode:-n/a}"
+    echo "- Predicted family: ${bug_model_family:-unknown} (score=${bug_model_family_score})"
+    echo "- Risk score: ${bug_model_risk_score}"
+    echo "- Top hunk: ${bug_model_hunk_file:-n/a}:${bug_model_hunk_line:-n/a} (confidence=${bug_model_best_hunk_score})"
+    echo
+    echo "## 4. Prioritized Findings"
+    cat "$findings_md"
+    echo
+    echo "## 5. Proposed Review Comments (Human Approval Required)"
+    if [[ -s "$proposed_comments_md" ]]; then
+      cat "$proposed_comments_md"
+    else
+      echo "- No draft comments generated."
+    fi
+  } > "$report_md"
+
+  {
+    echo "# Draft Review Comments"
+    echo
+    echo "PR: ${owner}/${repo} #${pr_number} - ${pr_title}"
+    echo
+    echo "_Draft-only until human approval._"
+    echo
+    if [[ -s "$proposed_comments_tsv" ]]; then
+      cidx=0
+      while IFS=$'\t' read -r sev file line msg; do
+        cidx=$((cidx + 1))
+        echo "## C${cidx}"
+        echo "- Severity: ${sev^^}"
+        echo "- Location: ${file}:${line}"
+        echo "- Comment: ${msg}"
+        echo
+      done < "$proposed_comments_tsv"
+    else
+      echo "- No draft comments generated."
+    fi
+  } > "$review_comments_md"
+
+  if [[ -n "$report_file" ]]; then
+    cp "$report_md" "$report_file"
+    review_comments_out="$(dirname "$report_file")/review_comments.md"
+  elif [[ -n "$output_file" ]]; then
+    cp "$report_md" "$output_file"
+    review_comments_out="$(dirname "$output_file")/review_comments.md"
+  else
+    cat "$report_md"
+  fi
+  cp "$review_comments_md" "$review_comments_out"
+  exit 0
+}
+
+run_repo_bug_model_rules_only
 
 # Autonomous findings from patch content (primary signal).
 while IFS=$'\t' read -r file line text; do
@@ -970,6 +1225,132 @@ extract_checkpatch_inline_candidates() {
   }' "$log_file"
 }
 
+resolve_bug_scorer_cmd() {
+  if [[ -n "$bug_scorer_cmd" ]]; then
+    printf '%s' "$bug_scorer_cmd"
+    return 0
+  fi
+
+  if [[ -x "/local/mnt/workspace/git/ml-bug-feature-extractor/install.sh" ]]; then
+    printf '%s' "/local/mnt/workspace/git/ml-bug-feature-extractor/install.sh --score-pairwise"
+    return 0
+  fi
+
+  if [[ -x "$HOME/git/ml-bug-feature-extractor/install.sh" ]]; then
+    printf '%s' "$HOME/git/ml-bug-feature-extractor/install.sh --score-pairwise"
+    return 0
+  fi
+
+  return 1
+}
+
+run_bug_model_signal() {
+  local resolved_cmd=""
+  local model_raw=""
+  local model_json_payload=""
+  local single_commit=""
+  local action_text=""
+  local location_text="model-scorer"
+  local severity="medium"
+  local predicted_flag="false"
+  local scorer_args=()
+
+  if [[ -z "$bug_model_path" ]]; then
+    bug_model_status="disabled"
+    return 0
+  fi
+
+  if [[ ! -f "$bug_model_path" ]]; then
+    bug_model_status="model-not-found"
+    return 0
+  fi
+
+  resolved_cmd="$(resolve_bug_scorer_cmd || true)"
+  if [[ -z "$resolved_cmd" ]]; then
+    bug_model_status="scorer-not-found"
+    return 0
+  fi
+
+  read -r -a scorer_args <<< "$resolved_cmd"
+  if [[ "${#scorer_args[@]}" -eq 0 ]]; then
+    bug_model_status="scorer-args-invalid"
+    return 0
+  fi
+
+  single_commit="$(jq -r 'if length==1 then .[0].sha // "" else "" end' "$commits_json")"
+
+  bug_model_ran=1
+  if [[ -n "$single_commit" ]]; then
+    model_raw="$("${scorer_args[@]}" \
+      --model "$bug_model_path" \
+      --repo "$repo_dir" \
+      --mode head \
+      --commit "$single_commit" \
+      --binary-threshold "$bug_binary_threshold" \
+      --family-threshold "$bug_family_threshold" \
+      --hunk-threshold "$bug_hunk_threshold" \
+      --topk-hunks "$bug_topk_hunks" \
+      --json 2>>"$kernel_vuln_log" || true)"
+  else
+    model_raw="$("${scorer_args[@]}" \
+      --model "$bug_model_path" \
+      --repo "$repo_dir" \
+      --mode range \
+      --range "$base_ref..$head_ref" \
+      --binary-threshold "$bug_binary_threshold" \
+      --family-threshold "$bug_family_threshold" \
+      --hunk-threshold "$bug_hunk_threshold" \
+      --topk-hunks "$bug_topk_hunks" \
+      --json 2>>"$kernel_vuln_log" || true)"
+  fi
+
+  model_json_payload="$(printf '%s\n' "$model_raw" | sed -n '/^{/,$p')"
+  if [[ -z "$model_json_payload" ]]; then
+    bug_model_status="scorer-output-empty"
+    return 0
+  fi
+
+  printf '%s\n' "$model_json_payload" > "$bug_model_json"
+  if ! jq -e . "$bug_model_json" >/dev/null 2>&1; then
+    bug_model_status="scorer-output-invalid-json"
+    return 0
+  fi
+
+  bug_model_status="ok"
+  bug_model_risk_score="$(jq -r '.bug_risk_score // 0' "$bug_model_json")"
+  bug_model_review_mode="$(jq -r '.review_mode // ""' "$bug_model_json")"
+  bug_model_family="$(jq -r '.predicted_bug_family // ""' "$bug_model_json")"
+  bug_model_family_score="$(jq -r '.predicted_bug_family_score // 0' "$bug_model_json")"
+  bug_model_best_hunk_score="$(jq -r '.best_hunk_score // 0' "$bug_model_json")"
+  bug_model_hunk_file="$(jq -r '.hunks_topk[0].file // ""' "$bug_model_json")"
+  bug_model_hunk_line="$(jq -r '.hunks_topk[0].line_start // ""' "$bug_model_json")"
+  bug_model_memory_used="$(jq -r '.memory_used // false' "$bug_model_json")"
+  predicted_flag="$(jq -r '.predicted_bug_introducing // false' "$bug_model_json")"
+  action_text="$(jq -r '.review_comments[0].detail // ""' "$bug_model_json")"
+  if [[ -z "$action_text" ]]; then
+    action_text="Run focused manual validation on the top-ranked hunk and confirm bug-family-specific invariants before approval."
+  fi
+
+  if [[ -n "$bug_model_hunk_file" && "$bug_model_hunk_line" =~ ^[0-9]+$ ]]; then
+    location_text="${bug_model_hunk_file}:${bug_model_hunk_line}"
+  fi
+
+  if [[ "$predicted_flag" == "true" && "$bug_model_review_mode" == "actual-bug" && -n "$bug_model_family" ]]; then
+    severity="high"
+    add_finding "$severity" "correctness" "$location_text" \
+      "Model-assisted detector predicts ${bug_model_family} (risk=${bug_model_risk_score}, family=${bug_model_family_score}, hunk=${bug_model_best_hunk_score}, mode=${bug_model_review_mode}, memory_used=${bug_model_memory_used})." \
+      "Likely ${bug_model_family} defect in changed code path; merge without targeted validation may ship a latent vulnerability/regression." \
+      "$action_text" \
+      "ML-PAIRWISE-DETECTOR" "https://github.com/openai"
+  elif [[ "$predicted_flag" == "true" ]]; then
+    add_finding "$severity" "correctness" "model-scorer" \
+      "Model-assisted detector raised risk signal (risk=${bug_model_risk_score}, family=${bug_model_family:-unknown}, family_score=${bug_model_family_score}, mode=${bug_model_review_mode})." \
+      "Patch appears bug-prone but bug-family/location confidence did not pass full gates." \
+      "$action_text" \
+      "ML-PAIRWISE-RISK" "https://github.com/openai"
+  fi
+}
+
 style_family_detected="$(detect_style_family "$repo_dir")"
 
 if [[ -z "$checkpatch_cmd" ]]; then
@@ -1172,6 +1553,9 @@ if [[ "$clang_semantic_available" -eq 1 ]]; then
     fi
   fi
 fi
+
+# Model-assisted bug signal (optional): inject bug-family/location findings into the same review flow.
+run_bug_model_signal
 
 # Build deterministic comment-submit batches for human-approved posting.
 proposed_comments_total=0
@@ -1632,6 +2016,17 @@ fi
   if [[ "$kernel_vuln_rules_ran" -eq 1 ]]; then
     echo "- Kernel-vuln rule findings generated: ${kernel_vuln_findings_total}"
   fi
+  echo "- Model-assisted bug detector ran: $([[ "$bug_model_ran" -eq 1 ]] && echo yes || echo no)"
+  echo "- Model-assisted bug detector status: ${bug_model_status}"
+  if [[ "$bug_model_status" == "ok" ]]; then
+    echo "- Model artifact: ${bug_model_path}"
+    echo "- Model thresholds: binary=${bug_binary_threshold}, family=${bug_family_threshold}, hunk=${bug_hunk_threshold}, topk_hunks=${bug_topk_hunks}"
+    echo "- Model review mode: ${bug_model_review_mode:-unknown}"
+    echo "- Model risk score: ${bug_model_risk_score}"
+    echo "- Model predicted family: ${bug_model_family:-unknown} (score=${bug_model_family_score})"
+    echo "- Model top hunk: ${bug_model_hunk_file:-n/a}:${bug_model_hunk_line:-n/a} (confidence=${bug_model_best_hunk_score})"
+    echo "- Model commit-memory hit: ${bug_model_memory_used}"
+  fi
   echo
   echo '```text'
   echo "checkpatch log (first 20 lines):"
@@ -1693,6 +2088,43 @@ fi
   fi
   echo '```'
 } > "$report_md"
+
+{
+  echo "# Draft Review Comments"
+  echo
+  echo "PR: ${owner}/${repo} #${pr_number} - ${pr_title}"
+  echo
+  echo "_Draft-only until human approval._"
+  echo
+  if [[ -s "$proposed_comments_tsv" ]]; then
+    cidx=0
+    while IFS=$'\t' read -r sev file line msg; do
+      cidx=$((cidx + 1))
+      echo "## C${cidx}"
+      echo "- Severity: ${sev^^}"
+      echo "- Location: ${file}:${line}"
+      echo "- Comment: ${msg}"
+      echo
+    done < "$proposed_comments_tsv"
+  else
+    echo "- No draft comments generated."
+    echo
+  fi
+  echo "## Open Questions"
+  if [[ -s "$open_questions_md" ]]; then
+    cat "$open_questions_md"
+  else
+    echo "- None."
+  fi
+} > "$review_comments_md"
+
+review_comments_out="$context_dir/review_comments.md"
+if [[ -n "$report_file" ]]; then
+  review_comments_out="$(dirname "$report_file")/review_comments.md"
+elif [[ -n "$output_file" ]]; then
+  review_comments_out="$(dirname "$output_file")/review_comments.md"
+fi
+cp "$review_comments_md" "$review_comments_out"
 
 if [[ -n "$report_file" ]]; then
   cp "$report_md" "$report_file"
