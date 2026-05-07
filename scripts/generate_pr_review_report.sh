@@ -117,6 +117,7 @@ require_cmd jq
 require_cmd awk
 require_cmd sed
 require_cmd git
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 [[ -n "$context_dir" ]] || err "--context-dir is required"
 [[ -n "$repo_dir" ]] || err "--repo-dir is required"
@@ -220,6 +221,9 @@ checkpatch_inline_raw_tsv="$tmp_dir/checkpatch_inline_raw.tsv"
 clang_semantic_log="$tmp_dir/clang_semantic.log"
 clang_semantic_raw_tsv="$tmp_dir/clang_semantic_raw.tsv"
 changed_c_files_txt="$tmp_dir/changed_c_files.txt"
+kernel_vuln_rules_json="$script_dir/../references/kernel_vuln_rules.json"
+kernel_vuln_raw_tsv="$tmp_dir/kernel_vuln_raw.tsv"
+kernel_vuln_log="$tmp_dir/kernel_vuln.log"
 added_lines_tsv="$tmp_dir/added_lines.tsv"
 pr_files_txt="$tmp_dir/pr_files.txt"
 local_files_txt="$tmp_dir/local_files.txt"
@@ -240,9 +244,14 @@ trap 'rm -rf "$tmp_dir"' EXIT
 : > "$clang_semantic_log"
 : > "$clang_semantic_raw_tsv"
 : > "$changed_c_files_txt"
+: > "$kernel_vuln_raw_tsv"
+: > "$kernel_vuln_log"
 : > "$added_lines_tsv"
 : > "$pr_files_txt"
 : > "$local_files_txt"
+
+kernel_vuln_rules_ran=0
+kernel_vuln_findings_total=0
 
 # Build changed file rows.
 jq -r '.[] | [(.filename // ""), (.status // ""), ((.additions // 0)|tostring), ((.deletions // 0)|tostring)] | @tsv' "$files_json" | \
@@ -470,6 +479,36 @@ END {
   }
 }' "$added_lines_tsv" | sed -n '1,8p')
 
+cb_sig_loc="$(awk -F'\t' '
+($1 ~ /\.(h|hpp)$/) &&
+($0 ~ /^[^\t]+\t[0-9]+\t.*void[[:space:]]*\(\*do_set_logging\)\(void[[:space:]]*\*priv,[[:space:]]*void[[:space:]]*\*data,[[:space:]]*rpmi_uint8_t[[:space:]]*is_be\)/) {
+  print $1 ":" $2
+  exit
+}' "$added_lines_tsv")"
+
+has_set_state_handler="$(awk -F'\t' '
+($1 ~ /\.(c|cc|cpp)$/) &&
+($3 ~ /rpmi_[A-Za-z0-9_]+_set_state/) {found=1}
+END {print (found ? "true" : "false")}' "$added_lines_tsv")"
+
+if [[ -n "$cb_sig_loc" && "$has_set_state_handler" == "true" ]]; then
+  add_finding "low" "maintainability" "$cb_sig_loc" \
+    "Callback name appears inconsistent with local set-state handler naming (do_set_logging vs *_set_state)." \
+    "Naming drift can obscure interface intent and increase review/maintenance overhead." \
+    "Align callback naming with local handler convention (for example do_set_state) or document why naming intentionally differs." \
+    "API-CB-NAMING-ALIGN" "https://go.dev/wiki/CodeReviewComments#initialisms"
+fi
+
+has_req_datalen="$(awk -F'\t' '($3 ~ /\<request_datalen\>/) {found=1} END{print (found ? "true" : "false")}' "$added_lines_tsv")"
+has_req_forward="$(awk -F'\t' '($3 ~ /set_[A-Za-z0-9_]+[[:space:]]*\(.*request_data/) {found=1} END{print (found ? "true" : "false")}' "$added_lines_tsv")"
+if [[ -n "$cb_sig_loc" && "$has_req_datalen" == "true" && "$has_req_forward" == "true" ]]; then
+  add_finding "medium" "correctness" "$cb_sig_loc" \
+    "Callback contract currently forwards raw request pointer/endianness instead of typed decoded fields." \
+    "Opaque callback payload contracts can hide parsing bugs and make platform implementations inconsistent." \
+    "Prefer a typed callback contract after local decode/unpack (for example do_set_logging(void *priv, uint32_t log_type, uint32_t datalen_bytes, void *data))." \
+    "API-CB-TYPED-SIGNATURE" "https://google.github.io/eng-practices/review/reviewer/looking-for.html#design"
+fi
+
 while IFS=$'\t' read -r file line group text; do
   [[ -n "$file" && -n "$line" && -n "$group" ]] || continue
   low=$((line - 80))
@@ -626,6 +665,24 @@ if [[ -n "$todo_lines" ]]; then
   add_finding "medium" "maintainability" "diff-added-lines" "$trimmed" "New deferred-work markers may ship unresolved work." "Resolve or track each TODO/FIXME with linked issue IDs and clear ownership."
 fi
 
+# Kernel-vuln rule pass (Phase 1): data-derived seed rules from historical bug corpora.
+if command -v python3 >/dev/null 2>&1 && [[ -f "$kernel_vuln_rules_json" ]] && [[ -x "$script_dir/apply_kernel_vuln_rules.py" ]]; then
+  kernel_vuln_rules_ran=1
+  if python3 "$script_dir/apply_kernel_vuln_rules.py" \
+    --added-lines-tsv "$added_lines_tsv" \
+    --rules-json "$kernel_vuln_rules_json" \
+    --repo-dir "$repo_dir" \
+    --files-json "$files_json" > "$kernel_vuln_raw_tsv" 2>>"$kernel_vuln_log"; then
+    if [[ -s "$kernel_vuln_raw_tsv" ]]; then
+      kernel_vuln_findings_total="$(wc -l < "$kernel_vuln_raw_tsv" | tr -d ' ')"
+      while IFS=$'\t' read -r sev cat loc evidence risk action rid rsrc rconf; do
+        [[ -n "$sev" && -n "$loc" ]] || continue
+        add_finding "$sev" "$cat" "$loc" "${evidence} (confidence=${rconf})" "$risk" "$action" "$rid" "$rsrc"
+      done < "$kernel_vuln_raw_tsv"
+    fi
+  fi
+fi
+
 # Existing reviewer comments are context by default; include as findings only when requested.
 while IFS=$'\t' read -r cid path line reviewer body; do
   loc="${path}:${line}"
@@ -722,7 +779,6 @@ clang_semantic_ran=0
 clang_semantic_warnings=0
 clang_semantic_inline_total=0
 clang_semantic_inline_included=0
-
 detect_style_family() {
   local root="$1"
   local review_text=""
@@ -1490,6 +1546,10 @@ fi
     echo "- clang semantic diagnostics captured: ${clang_semantic_inline_total}"
     echo "- clang semantic diagnostics converted to findings/comments: ${clang_semantic_inline_included}"
   fi
+  echo "- Kernel-vuln rule pack ran: $([[ "$kernel_vuln_rules_ran" -eq 1 ]] && echo yes || echo no)"
+  if [[ "$kernel_vuln_rules_ran" -eq 1 ]]; then
+    echo "- Kernel-vuln rule findings generated: ${kernel_vuln_findings_total}"
+  fi
   echo
   echo '```text'
   echo "checkpatch log (first 20 lines):"
@@ -1498,6 +1558,11 @@ fi
     echo
     echo "clang semantic log (first 20 lines):"
     sed -n '1,20p' "$clang_semantic_log"
+  fi
+  if [[ "$kernel_vuln_rules_ran" -eq 1 ]]; then
+    echo
+    echo "kernel-vuln rules log (first 20 lines):"
+    sed -n '1,20p' "$kernel_vuln_log"
   fi
   echo '```'
   echo

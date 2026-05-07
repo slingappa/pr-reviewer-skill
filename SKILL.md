@@ -36,6 +36,12 @@ Deep-crawl task catalog:
 - [`references/research_task_catalog.md`](references/research_task_catalog.md)
 - This catalog is mandatory input for topic-group checks and should be kept in sync with upstream guidance changes.
 
+Historical vulnerability rule corpus integration:
+- [`references/kernel_vuln_rules.json`](references/kernel_vuln_rules.json)
+- [`references/kernel_vuln_phase_plan.md`](references/kernel_vuln_phase_plan.md)
+- [`references/kernel_vuln_gate_thresholds.json`](references/kernel_vuln_gate_thresholds.json)
+- Use this as an additional autonomous signal source (not replacing semantic/manual reasoning).
+
 ## Required Inputs
 
 Request these inputs before starting review:
@@ -150,6 +156,8 @@ When complete, `review.md` must contain:
 - Do not auto-submit generated comments to GitHub.
 - A human reviewer must approve/edit each proposed comment before posting.
 - When checkpatch reports issues, generate file/line draft inline comments from those findings (with cap), and keep full counts visible in the report.
+- Default checkpatch inline cap is unlimited; use `--checkpatch-inline-cap <n>` only when intentionally constraining volume.
+- Group generated comments into submission batches and require human approval per batch before posting.
 
 ## Command Patterns
 
@@ -200,9 +208,43 @@ scripts/generate_pr_review_report.sh \
   --checkpatch-cmd "./scripts/checkpatch.pl --no-tree" \
   --output /tmp/pr-review-123/review.md
 
+# Optional: tune draft comment batching/checkpatch volume
+scripts/generate_pr_review_report.sh \
+  --context-dir /tmp/pr-review-123 \
+  --repo-dir /path/to/repo \
+  --comment-batch-size 50 \
+  --checkpatch-inline-cap 0 \
+  --output /tmp/pr-review-123/review.md
+
 # Overwrite repo review.md
 scripts/generate_pr_review_report.sh \
   --context-dir /tmp/pr-review-123 \
   --repo-dir /path/to/repo \
   --report-file /path/to/repo/review.md
+```
+
+Vulnerability-rule lifecycle scripts:
+```bash
+# Phase 1: mine candidate patterns from vulnerability dataset
+python3 scripts/mine_vuln_patterns.py \
+  --input /path/to/dataset.csv \
+  --output /tmp/vuln-patterns.json
+
+# Phase 2: benchmark curated rules on labeled samples
+scripts/run_rule_benchmark.sh \
+  --samples-csv /path/to/labeled_samples.csv \
+  --out-dir /tmp/pr-review-benchmark
+
+# Phase 3: update historical metrics and apply gate thresholds
+python3 scripts/update_rule_metrics.py \
+  --benchmark-json /tmp/pr-review-benchmark/latest_benchmark.json \
+  --history-json /tmp/pr-review-benchmark/history.json \
+  --min-precision 0.45 --min-recall 0.30 --min-f1 0.35
+
+# Phase 3 (profile mode): evaluate named gate profile
+python3 scripts/evaluate_rule_gate.py \
+  --benchmark-json /tmp/pr-review-benchmark/latest_benchmark.json \
+  --history-json /tmp/pr-review-benchmark/history.json \
+  --thresholds-json references/kernel_vuln_gate_thresholds.json \
+  --profile seed_baseline
 ```
