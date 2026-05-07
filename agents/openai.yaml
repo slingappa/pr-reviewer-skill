@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Reviewer"
+  short_description: "Review a GitHub PR and generate a prioritized review report"
+  default_prompt: "Use $pr-reviewer to create a new working branch first, then review a GitHub PR from PR URL + local repo path and generate autonomous prioritized findings in review.md."
