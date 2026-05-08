@@ -417,6 +417,7 @@ maybe_add_proposed_comment() {
   local key=""
   local key_evidence=""
   local msg=""
+  local preferred_msg=""
 
   case "$severity" in
     high|medium) ;;
@@ -437,7 +438,15 @@ maybe_add_proposed_comment() {
   fi
   echo "$key" >> "$proposed_comments_seen"
 
-  msg="Potential ${category} issue: ${evidence} Recommended: ${action}"
+  if [[ "$rule_id" == "REPO-BUG-MODEL-RULE-1" || "$rule_id" == "ML-PAIRWISE-DETECTOR" ]]; then
+    preferred_msg="$(build_model_precise_comment "$file" "$line" "$evidence" "$action" || true)"
+  fi
+
+  if [[ -n "$preferred_msg" ]]; then
+    msg="$preferred_msg"
+  else
+    msg="Potential ${category} issue: ${evidence} Recommended: ${action}"
+  fi
   if [[ -n "$rule_id" ]]; then
     msg="${msg} Rule: ${rule_id}."
   fi
@@ -450,6 +459,136 @@ maybe_add_proposed_comment() {
     echo "  - Draft comment: ${msg}"
   } >> "$proposed_comments_md"
   printf '%s\t%s\t%s\t%s\n' "$severity" "$file" "$line" "$msg" >> "$proposed_comments_tsv"
+  return 0
+}
+
+detect_model_family() {
+  local evidence="$1"
+  local family=""
+  family="${bug_model_family:-}"
+  if [[ -z "$family" ]]; then
+    family="$(printf '%s' "$evidence" | sed -nE 's/.*predicts ([a-z0-9-]+).*/\1/p' | head -n1 || true)"
+  fi
+  printf '%s' "$family"
+}
+
+source_line_for_location() {
+  local file="$1"
+  local line="$2"
+  local text=""
+  [[ "$line" =~ ^[0-9]+$ ]] || return 0
+  text="$(git -C "$repo_dir" show "${head_ref}:${file}" 2>/dev/null | sed -n "${line}p" || true)"
+  text="$(printf '%s' "$text" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\+/ /g')"
+  printf '%s' "$text"
+}
+
+model_cause_hint() {
+  local family="$1"
+  local source_line="$2"
+  case "$family" in
+    memory-leak)
+      if [[ "$source_line" =~ (g_new0|g_malloc|malloc|calloc|realloc|new[[:space:]]*\() ]]; then
+        printf '%s' "unconditional allocation on a repeated path can overwrite existing state and leak previous allocation"
+      else
+        printf '%s' "allocation/ownership lifecycle is inconsistent and can leak heap state across repeated execution paths"
+      fi
+      ;;
+    out-of-bounds|buffer-overflow|off-by-one)
+      printf '%s' "bounds for index/length are not strongly guaranteed on this code path, which can permit invalid memory access"
+      ;;
+    null-deref)
+      if [[ "$source_line" == *"->"* ]]; then
+        printf '%s' "pointer dereference is reached without a guaranteed non-NULL object on all paths"
+      else
+        printf '%s' "code path can operate on an uninitialized/NULL object"
+      fi
+      ;;
+    use-after-free)
+      printf '%s' "object lifetime/ownership can allow access after release on this path"
+      ;;
+    race-condition|deadlock)
+      printf '%s' "shared state transitions on this path can race without a single synchronization boundary"
+      ;;
+    integer-overflow|divide-by-zero)
+      printf '%s' "arithmetic safety checks are insufficient for all runtime inputs on this path"
+      ;;
+    double-free|refcount)
+      printf '%s' "resource lifetime accounting can become inconsistent, leading to invalid free/use paths"
+      ;;
+    uninitialized)
+      printf '%s' "state can be consumed before guaranteed initialization on this path"
+      ;;
+    *)
+      printf '%s' ""
+      ;;
+  esac
+}
+
+model_fix_hint() {
+  local family="$1"
+  local action="$2"
+  case "$family" in
+    memory-leak)
+      printf '%s' "guard one-time allocation/ownership (for example allocate only when pointer is NULL), and add explicit cleanup on all error/teardown paths"
+      ;;
+    out-of-bounds|buffer-overflow|off-by-one)
+      printf '%s' "add strict bounds checks before access and fail fast when index/length is outside valid range"
+      ;;
+    null-deref)
+      printf '%s' "add explicit NULL/stub validation before dereference and return a handled error when object state is invalid"
+      ;;
+    use-after-free)
+      printf '%s' "reorder lifetime so accesses happen before release and clear/re-own pointers after free"
+      ;;
+    race-condition|deadlock)
+      printf '%s' "protect this state transition with consistent locking/atomic discipline so checks and updates happen under one synchronization rule"
+      ;;
+    integer-overflow|divide-by-zero)
+      printf '%s' "validate arithmetic operands before operation and clamp/reject invalid values"
+      ;;
+    double-free|refcount)
+      printf '%s' "enforce single-owner release semantics and validate refcount transitions before free"
+      ;;
+    uninitialized)
+      printf '%s' "initialize state before first use and add guards for partial-init paths"
+      ;;
+    *)
+      if [[ -n "$action" ]]; then
+        printf '%s' "$action"
+      else
+        printf '%s' ""
+      fi
+      ;;
+  esac
+}
+
+build_model_precise_comment() {
+  local file="$1"
+  local line="$2"
+  local evidence="$3"
+  local action="$4"
+  local family=""
+  local source_line=""
+  local cause=""
+  local fix=""
+
+  family="$(detect_model_family "$evidence")"
+  source_line="$(source_line_for_location "$file" "$line")"
+  cause="$(model_cause_hint "$family" "$source_line")"
+  fix="$(model_fix_hint "$family" "$action")"
+
+  if [[ -z "$cause" || -z "$fix" ]]; then
+    return 1
+  fi
+
+  if [[ -n "$source_line" ]]; then
+    if [[ "${#source_line}" -gt 180 ]]; then
+      source_line="${source_line:0:177}..."
+    fi
+    printf '%s' "Specific cause: ${cause}. Path: ${file}:${line} (line: ${source_line}). Fix: ${fix}."
+  else
+    printf '%s' "Specific cause: ${cause}. Path: ${file}:${line}. Fix: ${fix}."
+  fi
   return 0
 }
 

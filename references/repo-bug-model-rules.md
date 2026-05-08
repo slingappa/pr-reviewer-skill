@@ -27,6 +27,11 @@ Outputs:
   - top localized hunk
   - model-generated prioritized finding(s)
 - Focused `review_comments.md` with draft inline comments only from model findings.
+- Preferred draft-comment format:
+  - `Specific cause: ...`
+  - `Path: <file>:<line> ...`
+  - `Fix: ...`
+  - Falls back to generic evidence/recommendation phrasing only when precise cause/fix inference is not possible.
 
 Default mode:
 - `--ruleset all` (default) keeps full cross-ecosystem review behavior and includes model findings as an extra signal when `--bug-model` is provided.
