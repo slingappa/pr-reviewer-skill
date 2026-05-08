@@ -214,6 +214,120 @@ base_branch="$(jq -r '.base.ref // empty' "$pr_json")"
 head_branch="$(jq -r '.head.ref // empty' "$pr_json")"
 pr_url="$(jq -r '.html_url // empty' "$pr_json")"
 
+normalize_remote_url() {
+  local raw="$1"
+  local host=""
+  local path=""
+  if [[ -z "$raw" ]]; then
+    return 0
+  fi
+  if [[ "$raw" =~ ^git@([^:]+):(.+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    path="${BASH_REMATCH[2]}"
+  elif [[ "$raw" =~ ^ssh://git@([^/]+)/(.+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    path="${BASH_REMATCH[2]}"
+  elif [[ "$raw" =~ ^https?://([^/]+)/(.+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    path="${BASH_REMATCH[2]}"
+  else
+    return 0
+  fi
+  path="${path%.git}"
+  path="${path#/}"
+  [[ -n "$host" && -n "$path" ]] || return 0
+  printf 'https://%s/%s' "$host" "$path"
+}
+
+resolve_comment_repo_url() {
+  local head_repo_html=""
+  local head_repo_clone=""
+  local base_repo_html=""
+  local base_repo_clone=""
+  local remote_url=""
+  local normalized=""
+  head_repo_html="$(jq -r '.head.repo.html_url // empty' "$pr_json" 2>/dev/null || true)"
+  if [[ -n "$head_repo_html" ]]; then
+    printf '%s' "$head_repo_html"
+    return 0
+  fi
+  head_repo_clone="$(jq -r '.head.repo.clone_url // .head.repo.git_url // empty' "$pr_json" 2>/dev/null || true)"
+  normalized="$(normalize_remote_url "$head_repo_clone" || true)"
+  if [[ -n "$normalized" ]]; then
+    printf '%s' "$normalized"
+    return 0
+  fi
+  base_repo_html="$(jq -r '.base.repo.html_url // empty' "$pr_json" 2>/dev/null || true)"
+  if [[ -n "$base_repo_html" ]]; then
+    printf '%s' "$base_repo_html"
+    return 0
+  fi
+  base_repo_clone="$(jq -r '.base.repo.clone_url // .base.repo.git_url // empty' "$pr_json" 2>/dev/null || true)"
+  normalized="$(normalize_remote_url "$base_repo_clone" || true)"
+  if [[ -n "$normalized" ]]; then
+    printf '%s' "$normalized"
+    return 0
+  fi
+  remote_url="$(git -C "$repo_dir" config --get remote.upstream.url || true)"
+  if [[ -z "$remote_url" ]]; then
+    remote_url="$(git -C "$repo_dir" config --get remote.origin.url || true)"
+  fi
+  normalized="$(normalize_remote_url "$remote_url" || true)"
+  if [[ -z "$normalized" && -n "$owner" && -n "$repo" ]]; then
+    normalized="https://github.com/${owner}/${repo}"
+  fi
+  printf '%s' "$normalized"
+}
+
+resolve_comment_head_sha() {
+  local cand=""
+  local resolved=""
+  while IFS= read -r cand; do
+    [[ -n "$cand" ]] || continue
+    [[ "$cand" =~ ^[0-9a-fA-F]{7,40}$ ]] || continue
+    resolved="$(git -C "$repo_dir" rev-parse --verify "${cand}^{commit}" 2>/dev/null || true)"
+    if [[ -n "$resolved" ]]; then
+      printf '%s' "$resolved"
+      return 0
+    fi
+  done <<EOF
+$(jq -r '.head.sha // empty' "$pr_json")
+$(jq -r '._meta.head_sha // empty' "$pr_json")
+$(jq -r '.[0].sha // empty' "$commits_json")
+$(jq -r '.[-1].sha // empty' "$commits_json")
+$head_ref
+EOF
+  return 0
+}
+
+urlencode_path() {
+  local value="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$value" <<'PY'
+import sys
+from urllib.parse import quote
+print(quote(sys.argv[1], safe="/._-~"))
+PY
+  else
+    printf '%s' "$value"
+  fi
+}
+
+comment_repo_url="$(resolve_comment_repo_url)"
+comment_head_sha="$(resolve_comment_head_sha)"
+
+build_comment_permalink() {
+  local file="$1"
+  local line="$2"
+  local file_enc=""
+  [[ -n "$comment_repo_url" ]] || return 0
+  [[ -n "$comment_head_sha" ]] || return 0
+  [[ "$line" =~ ^[0-9]+$ ]] || return 0
+  file_enc="$(urlencode_path "$file")"
+  [[ -n "$file_enc" ]] || return 0
+  printf '%s/blob/%s/%s#L%s' "$comment_repo_url" "$comment_head_sha" "$file_enc" "$line"
+}
+
 resolve_base_ref() {
   local root="$1"
   local base="$2"
@@ -276,6 +390,8 @@ rule_matrix_md="$tmp_dir/rule_matrix.md"
 proposed_comments_md="$tmp_dir/proposed_comments.md"
 proposed_comments_seen="$tmp_dir/proposed_comments.seen"
 proposed_comments_tsv="$tmp_dir/proposed_comments.tsv"
+comment_filter_rejects_tsv="$tmp_dir/comment_filter_rejects.tsv"
+added_line_keys_txt="$tmp_dir/added_line_keys.txt"
 comment_batches_md="$tmp_dir/comment_batches.md"
 checkpatch_log="$tmp_dir/checkpatch.log"
 checkpatch_inline_raw_tsv="$tmp_dir/checkpatch_inline_raw.tsv"
@@ -301,6 +417,8 @@ trap 'rm -rf "$tmp_dir"' EXIT
 : > "$proposed_comments_md"
 : > "$proposed_comments_seen"
 : > "$proposed_comments_tsv"
+: > "$comment_filter_rejects_tsv"
+: > "$added_line_keys_txt"
 : > "$comment_batches_md"
 : > "$checkpatch_log"
 : > "$checkpatch_inline_raw_tsv"
@@ -381,7 +499,10 @@ in_hunk {
 }
 ' > "$added_lines_tsv"
 
+awk -F'\t' 'NF >= 2 && $1 != "" && $2 ~ /^[0-9]+$/ {print $1 ":" $2}' "$added_lines_tsv" | sort -u > "$added_line_keys_txt"
+
 finding_id=0
+comment_reanchored_total=0
 add_finding() {
   local severity="$1"
   local category="$2"
@@ -404,6 +525,217 @@ add_finding() {
   maybe_add_proposed_comment "$severity" "$category" "$location" "$evidence" "$action" "$rule_id" "$rule_link" || true
 }
 
+is_code_file_for_review_comment() {
+  local file="$1"
+  case "$file" in
+    *.c|*.h|*.cc|*.cpp|*.cxx|*.hpp|*.hh|*.m|*.mm|*.S|*.s|*.asm|*.py|*.go|*.rs|*.java|*.js|*.ts|*.tsx|*.php|*.rb|*.pl|*.sh|*.asl|*.mk|*.dts|*.dtsi|Doxyfile|*/Doxyfile)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_non_actionable_source_line() {
+  local src="$1"
+  local trimmed=""
+  trimmed="$(printf '%s' "$src" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  [[ -n "$trimmed" ]] || return 0
+  printf '%s\n' "$trimmed" | grep -Eq '^#include[[:space:]]*<' && return 0
+  printf '%s\n' "$trimmed" | grep -Eq '^(//|/\*|\*|///)' && return 0
+  printf '%s\n' "$trimmed" | grep -Eq '^from:[[:space:]]' && return 0
+  printf '%s\n' "$trimmed" | grep -Eq '^#!/' && return 0
+  printf '%s\n' "$trimmed" | grep -Eq '^-?[[:space:]]+[[:alnum:]_./-]+\.(inf|dec|dsc|md|yaml|yml|json|toml|ini)$' && return 0
+  printf '%s\n' "$trimmed" | grep -Eq '^[[:alnum:]_./-]+\.(inf|dec|dsc|md|yaml|yml|json|toml|ini)$' && return 0
+  return 1
+}
+
+line_has_div_or_mod_expr() {
+  local src="$1"
+  printf '%s\n' "$src" | grep -Eq '[[:alnum:]_)\]]+[[:space:]]*/[[:space:]]*[[:alnum:]_(]+' && return 0
+  printf '%s\n' "$src" | grep -Eq '[[:alnum:]_)\]]+[[:space:]]%[[:space:]]*[[:alnum:]_(]+' && return 0
+  return 1
+}
+
+line_has_pointer_deref() {
+  local src="$1"
+  printf '%s\n' "$src" | grep -Eq -- '->|\\*[[:space:]]*[[:alnum:]_]|&[[:space:]]*[[:alnum:]_][[:alnum:]_]*->|\b(IS_ERR|IS_ERR_OR_NULL|PTR_ERR|WARN_ON|BUG_ON)[[:space:]]*\(|![[:space:]]*[[:alnum:]_][[:alnum:]_]*\b' && return 0
+  return 1
+}
+
+line_has_bounds_tokens() {
+  local src="$1"
+  printf '%s\n' "$src" | grep -Eiq '\[(.+)\]|\b(index|idx|len|length|size|count|offset|array|buffer|mask|policy|range|limit|end|start)\b|ARRAY_SIZE[[:space:]]*\(|sizeof[[:space:]]*\(|strnlen[[:space:]]*\(|WARN_ON[[:space:]]*\(|>=|<=|<|>|~[[:space:]]*[[:alnum:]_(]' && return 0
+  return 1
+}
+
+line_has_sync_tokens() {
+  local src="$1"
+  printf '%s\n' "$src" | grep -Eiq '\b(lock|unlock|mutex|spin|rwsem|semaphore|rcu|atomic|barrier|READ_ONCE|WRITE_ONCE|lockless|timer|work|queue|irq|preempt|wakeup|wait|completion|flush|cancel|stop|race|deadlock)\b' && return 0
+  return 1
+}
+
+comment_gate_reason=""
+comment_gate_resolved_line=""
+comment_gate_reanchor_note=""
+
+list_candidate_changed_lines() {
+  local file="$1"
+  local line="$2"
+  local window="$3"
+  awk -F'\t' -v f="$file" -v l="$line" -v w="$window" '
+($1 == f && $2 ~ /^[0-9]+$/) {
+  d = $2 - l
+  if (d < 0) d = -d
+  if (w < 0 || d <= w) print d "\t" $2
+}
+' "$added_lines_tsv" | sort -n -k1,1 -k2,2n | awk -F'\t' '!seen[$2]++ {print $2}'
+}
+
+line_passes_rule_specific_gates() {
+  local file="$1"
+  local cand_line="$2"
+  local source_line="$3"
+  local evidence="$4"
+  local rule_id="$5"
+  local lower=""
+  local ml_delta=0
+
+  lower="$(printf '%s %s' "$evidence" "$rule_id" | tr '[:upper:]' '[:lower:]')"
+
+  if [[ "$rule_id" == "ML-PAIRWISE-DETECTOR" || "$rule_id" == "REPO-BUG-MODEL-RULE-1" ]]; then
+    if [[ -n "$bug_model_hunk_file" && "$bug_model_hunk_line" =~ ^[0-9]+$ ]]; then
+      if [[ "$file" != "$bug_model_hunk_file" ]]; then
+        comment_gate_reason="ml-location-mismatch"
+        return 1
+      fi
+      ml_delta=$((cand_line - bug_model_hunk_line))
+      if [[ "$ml_delta" -lt 0 ]]; then
+        ml_delta=$(( -ml_delta ))
+      fi
+      if [[ "$ml_delta" -gt 8 ]]; then
+        if [[ "$ml_delta" -gt 30 ]]; then
+          comment_gate_reason="ml-location-mismatch"
+          return 1
+        fi
+      fi
+    fi
+    return 0
+  fi
+
+  if [[ "$lower" == *"divide/modulo"* || "$lower" == *"divide-by-zero"* || "$rule_id" == "KV-DIVIDE-BY-ZERO-1" ]]; then
+    if ! line_has_div_or_mod_expr "$source_line"; then
+      comment_gate_reason="no-divmod-expression"
+      return 1
+    fi
+  fi
+
+  if [[ "$lower" == *"unchecked return-value candidate"* ]]; then
+    case "$file" in
+      *.c|*.h|*.cc|*.cpp|*.cxx|*.hpp|*.hh) ;;
+      *)
+        comment_gate_reason="unchecked-return-non-c-family"
+        return 1
+        ;;
+    esac
+  fi
+
+  if [[ "$lower" == *"hardcoded secret/credential"* ]]; then
+    if ! printf '%s\n' "$source_line" | grep -Eqi '(AKIA[0-9A-Z]{16}|BEGIN[[:space:]]+PRIVATE[[:space:]]+KEY|password[[:space:]]*[:=][[:space:]]*["'\''][^"'\'']{6,}|passwd[[:space:]]*[:=][[:space:]]*["'\''][^"'\'']{6,}|api[_-]?key[[:space:]]*[:=][[:space:]]*["'\''][^"'\'']{6,}|secret[[:space:]]*[:=][[:space:]]*["'\''][^"'\'']{6,}|token[[:space:]]*[:=][[:space:]]*["'\''][^"'\'']{10,})'; then
+      comment_gate_reason="no-secret-literal-evidence"
+      return 1
+    fi
+  fi
+
+  if [[ "$lower" == *"null-deref"* || "$lower" == *"dereference"* || "$rule_id" == "KV-NULL-DEREF-1" ]]; then
+    if ! line_has_pointer_deref "$source_line"; then
+      comment_gate_reason="no-dereference-expression"
+      return 1
+    fi
+  fi
+
+  if [[ "$lower" == *"out-of-bounds"* || "$lower" == *"index/length"* || "$lower" == *"invalid memory access"* ]]; then
+    if ! line_has_bounds_tokens "$source_line"; then
+      comment_gate_reason="no-bounds-expression"
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+comment_passes_precision_gates() {
+  local file="$1"
+  local line="$2"
+  local evidence="$3"
+  local rule_id="$4"
+  local source_line=""
+  local lower=""
+  local key=""
+  local candidates=""
+  local cand=""
+
+  comment_gate_reason=""
+  comment_gate_resolved_line=""
+  comment_gate_reanchor_note=""
+  key="${file}:${line}"
+
+  if ! is_code_file_for_review_comment "$file"; then
+    comment_gate_reason="non-code-file"
+    return 1
+  fi
+
+  lower="$(printf '%s %s' "$evidence" "$rule_id" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$lower" == *"confidence=low"* ]]; then
+    comment_gate_reason="low-confidence-signal"
+    return 1
+  fi
+
+  if grep -Fqx "$key" "$added_line_keys_txt"; then
+    candidates="$line"
+    candidates="$(printf '%s\n%s\n%s\n' "$candidates" "$(list_candidate_changed_lines "$file" "$line" 5 || true)" "$(list_candidate_changed_lines "$file" "$line" 20 || true)" | sed '/^$/d' | awk '!seen[$0]++')"
+  else
+    candidates="$(list_candidate_changed_lines "$file" "$line" 5 || true)"
+    if [[ -z "$candidates" ]]; then
+      candidates="$(list_candidate_changed_lines "$file" "$line" 20 || true)"
+    fi
+    if [[ -z "$candidates" ]]; then
+      comment_gate_reason="not-on-changed-line"
+      return 1
+    fi
+  fi
+
+  while IFS= read -r cand; do
+    [[ "$cand" =~ ^[0-9]+$ ]] || continue
+    source_line="$(source_line_for_location "$file" "$cand")"
+    if is_non_actionable_source_line "$source_line"; then
+      if [[ "$rule_id" == "ML-PAIRWISE-DETECTOR" || "$rule_id" == "REPO-BUG-MODEL-RULE-1" ]] && [[ "${bug_model_family:-}" == "unknown" ]]; then
+        case "$file" in
+          *.mk|*.dts|*.dtsi|Doxyfile|*/Doxyfile)
+            comment_gate_resolved_line="$cand"
+            if [[ "$cand" != "$line" ]]; then
+              comment_gate_reanchor_note="auto-relocated from ${file}:${line} to ${file}:${cand}"
+            fi
+            return 0
+            ;;
+        esac
+      fi
+      comment_gate_reason="non-actionable-source-line"
+      continue
+    fi
+    if line_passes_rule_specific_gates "$file" "$cand" "$source_line" "$evidence" "$rule_id"; then
+      comment_gate_resolved_line="$cand"
+      if [[ "$cand" != "$line" ]]; then
+        comment_gate_reanchor_note="auto-relocated from ${file}:${line} to ${file}:${cand}"
+      fi
+      return 0
+    fi
+  done <<< "$candidates"
+
+  return 1
+}
+
 maybe_add_proposed_comment() {
   local severity="$1"
   local category="$2"
@@ -418,6 +750,7 @@ maybe_add_proposed_comment() {
   local key_evidence=""
   local msg=""
   local preferred_msg=""
+  local original_line=""
 
   case "$severity" in
     high|medium) ;;
@@ -430,6 +763,19 @@ maybe_add_proposed_comment() {
   file="${BASH_REMATCH[1]}"
   line="${BASH_REMATCH[2]}"
   [[ -n "$file" && -n "$line" ]] || return 1
+  original_line="$line"
+
+  if ! comment_passes_precision_gates "$file" "$line" "$evidence" "$rule_id"; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$severity" "$file" "$line" "$rule_id" "$comment_gate_reason" "$evidence" >> "$comment_filter_rejects_tsv"
+    return 1
+  fi
+  if [[ -n "$comment_gate_resolved_line" ]]; then
+    line="$comment_gate_resolved_line"
+    if [[ "$line" != "$original_line" ]]; then
+      comment_reanchored_total=$((comment_reanchored_total + 1))
+    fi
+  fi
 
   key_evidence="$(printf '%s' "$evidence" | sed 's/[[:space:]]\+/ /g')"
   key="${file}:${line}|${category}|${key_evidence}|${rule_id}|${rule_link}"
@@ -452,6 +798,9 @@ maybe_add_proposed_comment() {
   fi
   if [[ -n "$rule_link" ]]; then
     msg="${msg} Source: ${rule_link}."
+  fi
+  if [[ -n "$comment_gate_reanchor_note" ]]; then
+    msg="${msg} Location note: ${comment_gate_reanchor_note}."
   fi
   msg="$(printf '%s' "$msg" | sed 's/[[:space:]]\+/ /g' | sed 's/`//g')"
   {
@@ -833,6 +1182,7 @@ run_repo_bug_model_rules_only() {
     high_count="$(grep -Ec '^### F[0-9]+ - HIGH - ' "$findings_md" || true)"
     medium_count="$(grep -Ec '^### F[0-9]+ - MEDIUM - ' "$findings_md" || true)"
     low_count="$(grep -Ec '^### F[0-9]+ - LOW - ' "$findings_md" || true)"
+    comment_filter_reject_total_local="$(wc -l < "$comment_filter_rejects_tsv" | tr -d ' ')"
     echo "# PR Review Report"
     echo
     if [[ -n "$pr_url" ]]; then
@@ -851,6 +1201,8 @@ run_repo_bug_model_rules_only() {
     echo "- Local Diff Base/Head: ${base_ref}...${head_ref}"
     echo "- Ruleset mode: ${ruleset_mode}"
     echo "- Autonomous Findings: high=${high_count} medium=${medium_count} low=${low_count}"
+    echo "- Precision filter drops: ${comment_filter_reject_total_local}"
+    echo "- Precision re-anchors: ${comment_reanchored_total}"
     echo
     echo "## 2. Changed Files"
     echo "| File | Status | + | - |"
@@ -875,6 +1227,8 @@ run_repo_bug_model_rules_only() {
     cat "$findings_md"
     echo
     echo "## 5. Proposed Review Comments (Human Approval Required)"
+    echo "- Precision filter drops: ${comment_filter_reject_total_local}"
+    echo "- Precision re-anchors: ${comment_reanchored_total}"
     if [[ -s "$proposed_comments_md" ]]; then
       cat "$proposed_comments_md"
     else
@@ -892,10 +1246,14 @@ run_repo_bug_model_rules_only() {
     if [[ -s "$proposed_comments_tsv" ]]; then
       cidx=0
       while IFS=$'\t' read -r sev file line msg; do
+        link="$(build_comment_permalink "$file" "$line" || true)"
         cidx=$((cidx + 1))
         echo "## C${cidx}"
         echo "- Severity: ${sev^^}"
         echo "- Location: ${file}:${line}"
+        if [[ -n "$link" ]]; then
+          echo "- Link: ${link}"
+        fi
         echo "- Comment: ${msg}"
         echo
       done < "$proposed_comments_tsv"
@@ -1640,13 +1998,13 @@ run_bug_model_signal() {
       "Model-assisted detector predicts ${bug_model_family} (risk=${bug_model_risk_score}, family=${bug_model_family_score}, hunk=${bug_model_best_hunk_score}, mode=${bug_model_review_mode}, memory_used=${bug_model_memory_used})." \
       "Likely ${bug_model_family} defect in changed code path; merge without targeted validation may ship a latent vulnerability/regression." \
       "$action_text" \
-      "ML-PAIRWISE-DETECTOR" "https://github.com/openai"
+      "ML-PAIRWISE-DETECTOR" "https://github.com/slingappa/ml-bug-feature-extractor"
   elif [[ "$predicted_flag" == "true" ]]; then
     add_finding "$severity" "correctness" "model-scorer" \
       "Model-assisted detector raised risk signal (risk=${bug_model_risk_score}, family=${bug_model_family:-unknown}, family_score=${bug_model_family_score}, mode=${bug_model_review_mode})." \
       "Patch appears bug-prone but bug-family/location confidence did not pass full gates." \
       "$action_text" \
-      "ML-PAIRWISE-RISK" "https://github.com/openai"
+      "ML-PAIRWISE-RISK" "https://github.com/slingappa/ml-bug-feature-extractor"
   fi
 }
 
@@ -1872,6 +2230,23 @@ if [[ -s "$proposed_comments_tsv" ]]; then
       echo "- Batch ${b}/${comment_batches_total}: comments ${start}-${end} of ${proposed_comments_total}" >> "$comment_batches_md"
     done
   fi
+fi
+
+comment_filter_reject_total=0
+comment_filter_reject_summary="none"
+if [[ -s "$comment_filter_rejects_tsv" ]]; then
+  comment_filter_reject_total="$(wc -l < "$comment_filter_rejects_tsv" | tr -d ' ')"
+  comment_filter_reject_summary="$(awk -F'\t' '
+{ r[$5]++ }
+END {
+  first=1
+  for (k in r) {
+    if (!first) printf ", "
+    printf "%s=%d", k, r[k]
+    first=0
+  }
+}' "$comment_filter_rejects_tsv" | tr -d '\n')"
+  [[ -n "$comment_filter_reject_summary" ]] || comment_filter_reject_summary="none"
 fi
 
 # Optional clean finding when nothing else found.
@@ -2231,6 +2606,8 @@ fi
   echo "- Commits in PR: ${commits_count}"
   echo "- Cross-Ecosystem Mode: ${cross_ecosystem_mode}"
   echo "- Autonomous Findings: high=${high_count} medium=${medium_count} low=${low_count}"
+  echo "- Precision filter drops: ${comment_filter_reject_total} (${comment_filter_reject_summary})"
+  echo "- Precision re-anchors: ${comment_reanchored_total}"
   echo
   echo "## 2. Changed Files"
   echo "| File | Status | + | - |"
@@ -2349,6 +2726,8 @@ fi
     echo "- checkpatch-derived inline drafts: ${checkpatch_inline_included}/${checkpatch_inline_total} (cap=${checkpatch_inline_cap})"
   fi
   echo "- total draft comments: ${proposed_comments_total}"
+  echo "- precision filter drops: ${comment_filter_reject_total}"
+  echo "- precision re-anchors: ${comment_reanchored_total}"
   echo "- batch size for submission planning: ${comment_batch_size}"
   if [[ -s "$proposed_comments_md" ]]; then
     cat "$proposed_comments_md"
@@ -2399,10 +2778,14 @@ fi
   if [[ -s "$proposed_comments_tsv" ]]; then
     cidx=0
     while IFS=$'\t' read -r sev file line msg; do
+      link="$(build_comment_permalink "$file" "$line" || true)"
       cidx=$((cidx + 1))
       echo "## C${cidx}"
       echo "- Severity: ${sev^^}"
       echo "- Location: ${file}:${line}"
+      if [[ -n "$link" ]]; then
+        echo "- Link: ${link}"
+      fi
       echo "- Comment: ${msg}"
       echo
     done < "$proposed_comments_tsv"
