@@ -1,344 +1,342 @@
 {
-  "version": "2026-05-07",
-  "source": "kernel-vuln-data inspired rule seed set",
+  "version": "2026-05-09",
+  "source": "CWE Top-25 / CERT-C / MISRA-C inspired rules for kernel and firmware code review",
+  "notes": "Each rule requires concrete syntactic evidence on the flagged added line. Negative patterns exclude comments, string literals, and log calls. Aggregate checks require same-file scope evidence.",
   "rules": [
     {
-      "id": "KV-BUF-BOUNDS-1",
+      "id": "KV-BUF-OVERFLOW-1",
+      "cwe": "CWE-120",
       "severity": "high",
       "category": "memory-safety",
-      "pattern": "\\b(memcpy|memmove|strcpy|strncpy|strcat|sprintf|vsprintf)\\s*\\(",
+      "description": "Unsafe string/memory copy without explicit length bound",
+      "pattern": "\\b(strcpy|strcat|sprintf|gets|scanf)\\s*\\(",
       "negative_patterns": [
-        "sizeof\\s*\\(",
-        "ARRAY_SIZE\\s*\\(",
-        "strscpy\\s*\\("
+        "^\\s*//",
+        "^\\s*\\*",
+        "pr_\\w+\\s*\\(",
+        "printk\\s*\\(",
+        "dev_\\w+\\s*\\("
       ],
-      "risk": "Copy/format operations without obvious bounds guards can overflow buffers.",
-      "action": "Use bounded APIs and explicit length validation from trusted sources.",
-      "source": "https://www.kernel.org/doc/html/latest/process/submitting-patches.html#style-check-your-changes",
-      "confidence": "medium"
+      "file_globs": [
+        "*.c",
+        "*.h",
+        "*.cpp",
+        "*.cc"
+      ],
+      "risk": "Unbounded copy can overflow destination buffer; use strlcpy/strlcat/snprintf with explicit size.",
+      "action": "Replace with length-bounded variant (strlcpy, strlcat, snprintf) and verify destination size.",
+      "confidence": "high",
+      "aggregate_check": null
     },
     {
-      "id": "KV-UAF-LIFETIME-1",
+      "id": "KV-UAF-FREE-1",
+      "cwe": "CWE-416",
       "severity": "high",
       "category": "lifetime",
-      "pattern": "\\b(kfree|free|vfree)\\s*\\([^)]*\\)\\s*;",
-      "risk": "Freed object may still be reachable in later paths, enabling use-after-free.",
-      "action": "Null out references, enforce ownership, and validate post-free access paths.",
-      "source": "https://docs.kernel.org/process/submit-checklist.html",
-      "confidence": "low"
+      "description": "Pointer used after free in same changed hunk",
+      "pattern": "\\b(kfree|free|vfree|kvfree|kfree_skb)\\s*\\(\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\)",
+      "negative_patterns": [
+        "^\\s*//",
+        "^\\s*\\*",
+        "\\bkfree_skb\\s*\\(",
+        "\\bdev_kfree_skb\\s*\\(",
+        "\\bkfree_skb_any\\s*\\(",
+        "err_\\w+:",
+        "out_\\w+:",
+        "goto\\s+\\w+"
+      ],
+      "file_globs": [
+        "*.c",
+        "*.h",
+        "*.cpp"
+      ],
+      "risk": "Freeing a pointer that may still be referenced causes use-after-free.",
+      "action": "Set pointer to NULL after free; verify no remaining references before freeing.",
+      "confidence": "medium",
+      "aggregate_check": "potential_double_free"
     },
     {
       "id": "KV-NULL-DEREF-1",
+      "cwe": "CWE-476",
       "severity": "high",
       "category": "correctness",
-      "pattern": "->\\s*[A-Za-z_][A-Za-z0-9_]*\\s*\\(",
+      "description": "Pointer dereference via -> without preceding NULL check (excludes UEFI protocol globals)",
+      "pattern": "[A-Za-z_][A-Za-z0-9_]*\\s*->\\s*[A-Za-z_][A-Za-z0-9_]*\\s*\\(",
       "negative_patterns": [
-        "\\bif\\s*\\(.*->.*\\)",
-        "\\?\\s*.*->"
+        "^\\s*//",
+        "^\\s*\\*",
+        "\\bif\\s*\\(",
+        "\\bIS_ERR_OR_NULL\\s*\\(",
+        "\\bWARN_ON\\s*\\(",
+        "\\bBUG_ON\\s*\\(",
+        "\\bgBS\\s*->",
+        "\\bgRT\\s*->",
+        "\\bgST\\s*->",
+        "\\bThis\\s*->",
+        "\\bStatus\\s*=",
+        "\\bDEBUG\\s*\\(",
+        "\\bASSERT\\s*\\("
       ],
-      "risk": "Potential unchecked pointer/function-pointer call can crash under null state.",
-      "action": "Guard pointer and callback fields before dereference/invocation.",
-      "source": "https://clang.llvm.org/docs/analyzer/checkers.html#core-nulldereference",
-      "confidence": "low"
+      "file_globs": [
+        "*.c",
+        "*.h",
+        "*.cpp"
+      ],
+      "risk": "Dereferencing a potentially NULL pointer causes kernel panic or undefined behavior.",
+      "action": "Add NULL check before dereference; use IS_ERR_OR_NULL() for error-pointer paths.",
+      "confidence": "medium",
+      "aggregate_check": null
     },
     {
       "id": "KV-INTEGER-OVERFLOW-1",
+      "cwe": "CWE-190",
       "severity": "high",
       "category": "integer-safety",
-      "pattern": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([A-Za-z_][A-Za-z0-9_]*|\\d+)\\s*\\*\\s*([A-Za-z_][A-Za-z0-9_]*|\\d+)",
+      "description": "Arithmetic on user-controlled or size values without overflow check",
+      "pattern": "\\b(size|len|count|num|nr|n_\\w+)\\s*[+*]\\s*[A-Za-z0-9_]+",
       "negative_patterns": [
-        "check_mul_overflow\\s*\\(",
-        "size_mul\\s*\\(",
-        "overflow"
+        "^\\s*//",
+        "^\\s*\\*",
+        "sizeof\\s*\\(",
+        "ARRAY_SIZE\\s*\\(",
+        "pr_\\w+\\s*\\(",
+        "printk\\s*\\("
       ],
-      "risk": "Unchecked multiplication can overflow and under-allocate downstream buffers.",
-      "action": "Use overflow-check helpers before allocation/index arithmetic.",
-      "source": "https://docs.kernel.org/process/submit-checklist.html",
-      "confidence": "medium"
-    },
-    {
-      "id": "KV-LOCK-ORDER-1",
-      "severity": "medium",
-      "category": "concurrency",
-      "pattern": "\\b(spin_lock|mutex_lock|rwlock|write_lock|read_lock)\\s*\\(",
-      "risk": "Locking changes may introduce deadlocks/order inversion without paired review.",
-      "action": "Verify lock ordering and ensure all exits release locks.",
-      "source": "https://go.dev/wiki/CodeReviewComments#goroutine-lifetimes",
-      "confidence": "low"
-    },
-    {
-      "id": "KV-LOCK-UNLOCK-MISS-1",
-      "severity": "high",
-      "category": "concurrency",
-      "pattern": "\\b(spin_lock|mutex_lock|write_lock|read_lock)\\s*\\(",
-      "aggregate_check": "lock_unlock_balance",
-      "risk": "Lock acquisition without visible release can deadlock runtime paths.",
-      "action": "Ensure paired unlock on all return/error paths.",
-      "source": "https://docs.kernel.org/process/submit-checklist.html",
-      "confidence": "medium"
-    },
-    {
-      "id": "KV-RCU-MISUSE-1",
-      "severity": "high",
-      "category": "concurrency",
-      "pattern": "\\b(rcu_dereference|list_for_each_entry_rcu)\\b",
-      "negative_patterns": [
-        "rcu_read_lock\\s*\\(",
-        "srcu_read_lock\\s*\\("
+      "file_globs": [
+        "*.c",
+        "*.h"
       ],
-      "risk": "RCU dereference without read-side protection can race with free/update.",
-      "action": "Wrap RCU dereference iteration in proper read-side lock scope.",
-      "source": "https://docs.kernel.org/process/submit-checklist.html",
-      "confidence": "low"
+      "risk": "Integer overflow in size arithmetic can lead to under-allocation and heap overflow.",
+      "action": "Use checked arithmetic (check_add_overflow, check_mul_overflow) or saturating helpers.",
+      "confidence": "medium",
+      "aggregate_check": null
     },
     {
-      "id": "KV-USERCOPY-1",
-      "severity": "high",
-      "category": "boundary-validation",
-      "pattern": "\\b(copy_from_user|copy_to_user|get_user|put_user)\\s*\\(",
-      "negative_patterns": [
-        "\\bif\\s*\\(",
-        "access_ok\\s*\\("
-      ],
-      "risk": "User boundary copy without explicit validation can propagate invalid pointers/lengths.",
-      "action": "Validate pointer and size; handle partial-copy failures explicitly.",
-      "source": "https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html",
-      "confidence": "medium"
-    },
-    {
-      "id": "KV-ENDIANNESS-1",
-      "severity": "medium",
-      "category": "protocol-correctness",
-      "pattern": "\\b(request_data|payload|msg_data)\\b",
-      "negative_patterns": [
-        "le[0-9]+_to_cpu",
-        "be[0-9]+_to_cpu",
-        "rpmi_to_xe32",
-        "cpu_to_"
-      ],
-      "risk": "Payload parsing without explicit endianness conversion causes cross-platform misbehavior.",
-      "action": "Decode protocol fields at the boundary using explicit endian helpers.",
-      "source": "https://google.github.io/eng-practices/review/reviewer/looking-for.html#design",
-      "confidence": "medium"
-    },
-    {
-      "id": "KV-LENGTH-GUARD-1",
-      "severity": "high",
-      "category": "boundary-validation",
-      "pattern": "\\b(request_data|payload|msg_data)\\b",
-      "aggregate_check": "requires_length_guard",
-      "risk": "Parsing buffers without explicit length checks risks out-of-bounds reads/writes.",
-      "action": "Gate parsing with strict minimum/maximum length checks before dereference.",
-      "source": "https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html",
-      "confidence": "medium"
-    },
-    {
-      "id": "KV-ERROR-PROP-1",
-      "severity": "medium",
-      "category": "error-handling",
-      "pattern": "\\benum\\s+[A-Za-z_][A-Za-z0-9_]*\\s+ret\\s*=\\s*0\\s*;",
-      "aggregate_check": "constant_success_return",
-      "risk": "Default success codes can mask callback/operation failures.",
-      "action": "Propagate concrete error results and map them to protocol-visible codes.",
-      "source": "https://go.dev/wiki/CodeReviewComments#handle-errors",
-      "confidence": "medium"
-    },
-    {
-      "id": "KV-UNUSED-PARAM-1",
-      "severity": "medium",
-      "category": "api-contract",
-      "pattern": "\\brequest_datalen\\b",
-      "aggregate_check": "unused_parameter_signal",
-      "risk": "Unused API parameters imply incomplete validation and weak contracts.",
-      "action": "Use parameter in validation logic or remove it from interface.",
-      "source": "https://clang.llvm.org/docs/DiagnosticsReference.html#wunused-parameter",
-      "confidence": "medium"
-    },
-    {
-      "id": "KV-DEBUG-LEAK-1",
-      "severity": "medium",
-      "category": "security",
-      "pattern": "\\b(DPRINTF|pr_info|pr_warn|pr_err|printf|fprintf|trace|log_(info|warn|error|debug))\\b",
-      "secondary_pattern": "\\b(request_data|payload|token|secret|password|passwd|authorization|auth)\\b",
-      "risk": "Logging sensitive payload/auth values can expose secrets in logs.",
-      "action": "Redact sensitive fields and avoid raw payload/credential logging.",
-      "source": "https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html",
-      "confidence": "medium"
-    },
-    {
-      "id": "KV-AUTHZ-BYPASS-1",
-      "severity": "high",
-      "category": "security",
-      "pattern": "\\b(skip_auth|bypass_auth|allow_all|permit_all|auth_disabled|disable_auth|no_auth)\\b",
-      "risk": "Auth/authz bypass toggles can disable security controls in production paths.",
-      "action": "Enforce deny-by-default authorization and isolate test-only bypass logic.",
-      "source": "https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html#deny-by-default",
-      "confidence": "high"
-    },
-    {
-      "id": "KV-API-DOC-GROUP-1",
-      "severity": "low",
-      "category": "maintainability",
-      "pattern": "^\\s*enum\\s+rpmi_[A-Za-z0-9_]+_service_id\\s*\\{",
-      "aggregate_check": "missing_defgroup_nearby",
-      "risk": "New API/service blocks without grouping docs reduce discoverability and consistency.",
-      "action": "Add/update nearby \\defgroup docs for the introduced service/API family.",
-      "source": "https://www.doxygen.nl/manual/commands.html#cmddefgroup",
-      "confidence": "medium"
-    },
-    {
-      "id": "KV-API-TEST-COVERAGE-1",
-      "severity": "high",
-      "category": "testing-gap",
-      "aggregate_check": "api_change_without_tests",
-      "risk": "API changes without test updates can ship silent regressions.",
-      "action": "Add API-level regression tests for changed interface and failure behavior.",
-      "source": "https://google.github.io/eng-practices/review/reviewer/looking-for.html#tests",
-      "confidence": "high"
-    },
-    {
-      "id": "KV-API-RELNOTE-1",
-      "severity": "medium",
-      "category": "process",
-      "aggregate_check": "api_change_without_release_note",
-      "risk": "Consumers may miss migration or behavioral impact without release notes.",
-      "action": "Add release-note/changelog entry covering compatibility and migration impact.",
-      "source": "https://rust-lang.github.io/api-guidelines/checklist.html#c-relnotes",
-      "confidence": "high"
-    },
-    {
-      "id": "KV-MEMLEAK-1",
+      "id": "KV-MEMLEAK-ALLOC-1",
+      "cwe": "CWE-401",
       "severity": "medium",
       "category": "lifetime",
-      "pattern": "\\b(kmalloc|kzalloc|krealloc|vmalloc|calloc|malloc)\\s*\\(",
-      "aggregate_check": "alloc_without_free_hint",
-      "risk": "Allocation-heavy changes without visible release paths can leak memory over time.",
-      "action": "Confirm ownership and teardown/free paths for new allocations.",
-      "source": "https://docs.kernel.org/process/submit-checklist.html",
-      "confidence": "low"
-    },
-    {
-      "id": "KV-REFCOUNT-1",
-      "severity": "high",
-      "category": "lifetime",
-      "pattern": "\\b(refcount_inc|kref_get|atomic_inc|atomic_inc_return)\\s*\\(",
-      "aggregate_check": "refcount_without_put",
-      "risk": "Reference increments without matching put/dec in touched paths can leak objects or mask UAF.",
-      "action": "Verify refcount symmetry for all success and error paths.",
-      "source": "https://docs.kernel.org/process/submit-checklist.html",
-      "confidence": "medium"
+      "description": "Allocation in changed lines without visible free path in same diff",
+      "pattern": "\\b(kmalloc|kzalloc|krealloc|vmalloc|kvmalloc|devm_kmalloc|kstrdup|kasprintf)\\s*\\(",
+      "negative_patterns": [
+        "^\\s*//",
+        "^\\s*\\*"
+      ],
+      "file_globs": [
+        "*.c",
+        "*.cpp"
+      ],
+      "risk": "Allocation without matching free on all error/exit paths causes memory leak.",
+      "action": "Ensure every allocation has a matching free on all exit paths; prefer devm_ variants for device-managed resources.",
+      "confidence": "low",
+      "aggregate_check": "alloc_without_free_hint"
     },
     {
       "id": "KV-DOUBLE-FREE-1",
+      "cwe": "CWE-415",
       "severity": "high",
       "category": "lifetime",
-      "pattern": "\\b(kfree|free|vfree)\\s*\\(",
-      "aggregate_check": "potential_double_free",
-      "risk": "Multiple frees of the same pointer can corrupt allocator metadata and crash runtime.",
-      "action": "Guard free paths and null/reset ownership after free.",
-      "source": "https://docs.kernel.org/process/submit-checklist.html",
-      "confidence": "low"
-    },
-    {
-      "id": "KV-HANG-LOOP-1",
-      "severity": "medium",
-      "category": "availability",
-      "pattern": "\\b(while\\s*\\(\\s*1\\s*\\)|for\\s*\\(\\s*;\\s*;\\s*\\))",
+      "description": "Same pointer freed more than once in changed lines",
+      "pattern": "\\b(kfree|free|vfree|kvfree)\\s*\\(\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\)",
       "negative_patterns": [
-        "break\\s*;",
-        "timeout",
-        "watchdog"
+        "^\\s*//",
+        "^\\s*\\*",
+        "\\bkfree_skb\\s*\\(",
+        "\\bdev_kfree_skb\\s*\\("
       ],
-      "risk": "Potential non-terminating loops can cause hang/DoS under error conditions.",
-      "action": "Add explicit exit conditions, timeout guards, or watchdog-safe breaks.",
-      "source": "https://docs.kernel.org/process/submit-checklist.html",
-      "confidence": "low"
+      "file_globs": [
+        "*.c",
+        "*.cpp"
+      ],
+      "risk": "Double-free corrupts heap allocator metadata and can lead to arbitrary code execution.",
+      "action": "Set pointer to NULL after first free; use a single canonical free path.",
+      "confidence": "high",
+      "aggregate_check": "potential_double_free"
     },
     {
-      "id": "KV-RACE-WINDOW-1",
+      "id": "KV-LOCK-BALANCE-1",
+      "cwe": "CWE-667",
       "severity": "high",
       "category": "concurrency",
-      "pattern": "\\b(list_add|list_del|hlist_add|hlist_del|rb_insert_color|rb_erase)\\s*\\(",
+      "description": "Lock acquired in changed lines without matching unlock in same diff",
+      "pattern": "\\b(spin_lock|mutex_lock|write_lock|read_lock|spin_lock_irq|spin_lock_irqsave|mutex_lock_interruptible)\\s*\\(",
       "negative_patterns": [
-        "spin_lock\\s*\\(",
-        "mutex_lock\\s*\\(",
-        "rcu_read_lock\\s*\\("
+        "^\\s*//",
+        "^\\s*\\*",
+        "\\bspin_lock_init\\s*\\(",
+        "\\bmutex_init\\s*\\(",
+        "\\brwlock_init\\s*\\(",
+        "\\bspin_lock_destroy\\s*\\(",
+        "\\bmutex_destroy\\s*\\("
       ],
-      "risk": "Shared-structure mutation without visible synchronization can introduce data races.",
-      "action": "Protect shared updates with appropriate lock/RCU discipline.",
-      "source": "https://go.dev/wiki/CodeReviewComments#goroutine-lifetimes",
-      "confidence": "low"
+      "file_globs": [
+        "*.c",
+        "*.h"
+      ],
+      "risk": "Unbalanced lock acquisition causes deadlock or lock held across unexpected paths.",
+      "action": "Ensure every lock acquisition has a matching unlock on all exit paths; prefer scoped lock helpers.",
+      "confidence": "medium",
+      "aggregate_check": "lock_unlock_balance"
     },
     {
-      "id": "KV-DEADLOCK-NESTED-1",
+      "id": "KV-USERCOPY-UNCHECKED-1",
+      "cwe": "CWE-20",
       "severity": "high",
-      "category": "concurrency",
-      "pattern": "\\b(mutex_lock|spin_lock|write_lock|read_lock)\\s*\\(.*\\b(mutex_lock|spin_lock|write_lock|read_lock)\\s*\\(",
-      "risk": "Nested lock acquisition can introduce lock-order inversions and deadlocks.",
-      "action": "Validate lock ordering and document nesting constraints explicitly.",
-      "source": "https://docs.kernel.org/process/submit-checklist.html",
-      "confidence": "low"
+      "category": "boundary-validation",
+      "description": "copy_from_user / copy_to_user result not checked",
+      "pattern": "\\b(copy_from_user|copy_to_user|get_user|put_user|__copy_from_user)\\s*\\(",
+      "negative_patterns": [
+        "^\\s*//",
+        "^\\s*\\*",
+        "if\\s*\\(",
+        "ret\\s*=",
+        "err\\s*=",
+        "rc\\s*="
+      ],
+      "file_globs": [
+        "*.c"
+      ],
+      "risk": "Unchecked user-copy return value allows partial copy to go undetected, causing data corruption or info leak.",
+      "action": "Always check return value of copy_from/to_user; treat non-zero as error and propagate -EFAULT.",
+      "confidence": "high",
+      "aggregate_check": null
+    },
+    {
+      "id": "KV-FORMAT-STRING-1",
+      "cwe": "CWE-134",
+      "severity": "high",
+      "category": "security",
+      "description": "Non-literal format string passed to printf-family function",
+      "pattern": "\\b(sprintf|snprintf|printf|fprintf|seq_printf|dev_err|dev_warn|dev_info)\\s*\\([^,)]+,\\s*[A-Za-z_][A-Za-z0-9_]*\\s*[,)]",
+      "negative_patterns": [
+        "^\\s*//",
+        "^\\s*\\*",
+        "\"[^\"]*\""
+      ],
+      "file_globs": [
+        "*.c",
+        "*.cpp"
+      ],
+      "risk": "Variable format string allows attacker-controlled format specifiers leading to info leak or memory corruption.",
+      "action": "Use a string literal as the format argument; pass variable data as subsequent arguments.",
+      "confidence": "medium",
+      "aggregate_check": null
     },
     {
       "id": "KV-DIVIDE-BY-ZERO-1",
+      "cwe": "CWE-369",
       "severity": "high",
       "category": "correctness",
-      "pattern": "\\b[A-Za-z_][A-Za-z0-9_]*\\s*/\\s*[A-Za-z_][A-Za-z0-9_]*\\b",
+      "description": "Division or modulo where divisor may be zero",
+      "pattern": "[A-Za-z_][A-Za-z0-9_]*\\s*/\\s*[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*\\s*%\\s*[A-Za-z_][A-Za-z0-9_]*",
       "negative_patterns": [
-        "if\\s*\\(.*!=\\s*0",
-        "if\\s*\\(.*>\\s*0",
-        "if\\s*\\(.*>=\\s*1"
+        "^\\s*//",
+        "^\\s*\\*",
+        "sizeof\\s*\\(",
+        "ARRAY_SIZE\\s*\\(",
+        "PAGE_SIZE",
+        "HZ\\b"
       ],
-      "risk": "Division without denominator validation can trigger runtime faults.",
-      "action": "Add explicit non-zero denominator checks before division.",
-      "source": "https://docs.kernel.org/process/submit-checklist.html",
-      "confidence": "low"
+      "file_globs": [
+        "*.c",
+        "*.h",
+        "*.cpp"
+      ],
+      "risk": "Division by zero causes kernel oops or undefined behavior.",
+      "action": "Guard divisor with explicit zero check before division; use DIV_ROUND_UP/DIV_ROUND_DOWN helpers.",
+      "confidence": "medium",
+      "aggregate_check": null
     },
     {
-      "id": "KV-SIGNEDNESS-1",
+      "id": "KV-REFCOUNT-LEAK-1",
+      "cwe": "CWE-401",
       "severity": "medium",
-      "category": "integer-safety",
-      "pattern": "\\b(size_t|u32|u64|unsigned)\\b[^;]*<\\s*0\\b",
-      "risk": "Signedness mismatch checks can be ineffective and hide boundary bugs.",
-      "action": "Use consistent signed/unsigned types and explicit conversion/validation.",
-      "source": "https://docs.kernel.org/process/submit-checklist.html",
-      "confidence": "medium"
-    },
-    {
-      "id": "KV-INFO-LEAK-1",
-      "severity": "medium",
-      "category": "security",
-      "pattern": "\\b(pr_info|pr_warn|pr_err|printk|printf|fprintf)\\s*\\(.*%p",
+      "category": "lifetime",
+      "description": "Reference count incremented without matching decrement in changed lines",
+      "pattern": "\\b(refcount_inc|kref_get|atomic_inc|get_device|kobject_get|skb_get)\\s*\\(",
       "negative_patterns": [
-        "%pK",
-        "hash"
+        "^\\s*//",
+        "^\\s*\\*"
       ],
-      "risk": "Raw pointer/address logging can leak sensitive kernel layout information.",
-      "action": "Use hardened pointer formats and avoid exposing raw addresses.",
-      "source": "https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html",
-      "confidence": "medium"
+      "file_globs": [
+        "*.c",
+        "*.h"
+      ],
+      "risk": "Unbalanced refcount increment causes object to never be freed (memory/resource leak).",
+      "action": "Ensure every refcount_inc/kref_get has a matching put/dec on all exit paths.",
+      "confidence": "low",
+      "aggregate_check": "refcount_without_put"
     },
     {
-      "id": "KV-MISSING-CHECK-1",
-      "severity": "high",
+      "id": "KV-MISSING-RETVAL-1",
+      "cwe": "CWE-703",
+      "severity": "medium",
       "category": "error-handling",
-      "pattern": "\\b(copy_from_user|copy_to_user|kmalloc|kzalloc|vmalloc|alloc|mutex_lock)\\s*\\(",
-      "aggregate_check": "missing_check_hint",
-      "risk": "Fallible operations without explicit result checks can propagate silent corruption.",
-      "action": "Capture and validate return values; handle failures immediately.",
-      "source": "https://go.dev/wiki/CodeReviewComments#handle-errors",
-      "confidence": "low"
+      "description": "Return value of fallible kernel function discarded",
+      "pattern": "^\\s*(kmalloc|kzalloc|vmalloc|alloc_workqueue|request_irq|platform_get_irq|devm_ioremap|ioremap)\\s*\\(",
+      "negative_patterns": [
+        "^\\s*//",
+        "^\\s*\\*",
+        "=\\s*(kmalloc|kzalloc|vmalloc|alloc_workqueue|request_irq|platform_get_irq|devm_ioremap|ioremap)",
+        "if\\s*\\("
+      ],
+      "file_globs": [
+        "*.c"
+      ],
+      "risk": "Discarding return value of fallible function means errors go undetected, causing NULL dereference or resource leak.",
+      "action": "Assign return value and check for NULL/error before use.",
+      "confidence": "high",
+      "aggregate_check": null
     },
     {
-      "id": "KV-NAMING-CONSISTENCY-1",
-      "severity": "low",
-      "category": "maintainability",
-      "pattern": "\\bdo_set_[A-Za-z0-9_]+\\b",
-      "aggregate_check": "callback_name_inconsistency",
-      "risk": "Inconsistent callback/function naming can mislead reviewers and maintainers about semantics.",
-      "action": "Align callback and service-handler naming with existing subsystem conventions.",
-      "source": "https://go.dev/wiki/CodeReviewComments#initialisms",
-      "confidence": "low"
+      "id": "KV-RACE-WINDOW-1",
+      "cwe": "CWE-362",
+      "severity": "high",
+      "category": "concurrency",
+      "description": "List/tree structure modified without lock in changed lines",
+      "pattern": "\\b(list_add|list_del|list_del_init|hlist_add_head|hlist_del|rb_insert_color|rb_erase)\\s*\\(",
+      "negative_patterns": [
+        "^\\s*//",
+        "^\\s*\\*",
+        "INIT_LIST_HEAD\\s*\\(",
+        "list_head_init\\s*\\("
+      ],
+      "file_globs": [
+        "*.c",
+        "*.h"
+      ],
+      "risk": "Modifying shared list/tree without holding appropriate lock causes data structure corruption under concurrency.",
+      "action": "Hold the appropriate lock (spin_lock, mutex_lock, rcu_read_lock) around list/tree modifications.",
+      "confidence": "medium",
+      "aggregate_check": null
+    },
+    {
+      "id": "KV-HARDCODED-SECRET-1",
+      "cwe": "CWE-798",
+      "severity": "high",
+      "category": "security",
+      "description": "Hardcoded credential or secret literal in source",
+      "pattern": "(password|passwd|secret|api_key|token|private_key)\\s*=\\s*\"[^\"]{6,}\"",
+      "negative_patterns": [
+        "^\\s*//",
+        "^\\s*\\*",
+        "example",
+        "test",
+        "dummy",
+        "placeholder"
+      ],
+      "file_globs": [
+        "*.c",
+        "*.h",
+        "*.cpp",
+        "*.py",
+        "*.sh",
+        "*.conf"
+      ],
+      "risk": "Hardcoded credentials in source are exposed in version control and binaries.",
+      "action": "Remove hardcoded credential; load from secure configuration, environment variable, or key management system.",
+      "confidence": "high",
+      "aggregate_check": null
     }
   ]
 }

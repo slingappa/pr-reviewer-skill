@@ -1452,7 +1452,7 @@ done < <(awk -F'\t' '($3 ~ /(console\.log\(|debugger;|pdb\.set_trace\(|fmt\.Prin
 while IFS=$'\t' read -r file line text; do
   loc="${file}:${line}"
   add_finding "medium" "correctness" "$loc" "Broad exception handling added: ${text}" "Overly broad catches can hide real failures and reduce debuggability." "Catch explicit exception types and preserve actionable error context."
-done < <(awk -F'\t' '($3 ~ /(except[[:space:]]+Exception|catch[[:space:]]*\([[:space:]]*Exception[[:space:]]*[a-zA-Z0-9_]*[[:space:]]*\)|catch[[:space:]]*\(\.\.\.\)|rescue[[:space:]]+StandardError)/) {print $1 "\t" $2 "\t" $3}' "$added_lines_tsv" | sed -n '1,10p')
+done < <(awk -F'\t' '($1 !~ /\.(plugin|Plugin|tool|Tool|script|Script|pytool|check|Check|util|Util)/ && $1 !~ /^\.github\/|^\.pytool\/|^\.azurepipelines\/|^BaseTools\/Scripts\/|^BaseTools\/Plugin\// && $3 ~ /(except[[:space:]]+Exception|catch[[:space:]]*\([[:space:]]*Exception[[:space:]]*[a-zA-Z0-9_]*[[:space:]]*\)|catch[[:space:]]*\(\.\.\.\)|rescue[[:space:]]+StandardError)/) {print $1 "\t" $2 "\t" $3}' "$added_lines_tsv" | sed -n '1,10p')
 
 # Medium severity: source changed without tests touched.
 code_changed="$(jq -r 'any(.[]; (.filename|test("^(src/|lib/|core/|pkg/|cmd/|kernel/|drivers/|arch/|include/)")))' "$files_json")"

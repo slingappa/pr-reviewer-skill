@@ -115,9 +115,12 @@ def detect_aggregate(
         for file, flines in by_file.items():
             lock_count = sum(1 for ln in flines if lock_re.search(ln.text))
             unlock_count = sum(1 for ln in flines if unlock_re.search(ln.text))
-            if lock_count > 0 and unlock_count < lock_count:
-                first = next((ln for ln in flines if lock_re.search(ln.text)), flines[0])
-                hits.append((f"{file}:{first.line}", f"lock_count={lock_count}, unlock_count={unlock_count}", ""))
+            code_lines = [ln for ln in flines if not re.match(r'^\s*(/\*|\*|//)', ln.text)]
+            lock_lines = [ln for ln in code_lines if lock_re.search(ln.text)]
+            unlock_count_code = sum(1 for ln in code_lines if unlock_re.search(ln.text))
+            if lock_lines and unlock_count_code == 0:
+                first = lock_lines[0]
+                hits.append((f"{file}:{first.line}", f"lock acquired in diff ({len(lock_lines)}x) with no matching unlock in same diff", ""))
         return hits
 
     if agg == "alloc_without_free_hint":
@@ -145,19 +148,36 @@ def detect_aggregate(
     if agg == "potential_double_free":
         free_re = re.compile(r"\b(kfree|free|vfree)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)")
         for file, flines in by_file.items():
-            seen: Dict[str, int] = {}
-            first_line: Dict[str, int] = {}
+            func_re = re.compile(r'^[A-Za-z_][A-Za-z0-9_\s\*]+\s+[A-Za-z_][A-Za-z0-9_]*\s*\(')
+            cur_func_start = 0
+            func_groups: list = []
+            cur_group: list = []
             for ln in flines:
-                m = free_re.search(ln.text)
-                if not m:
-                    continue
-                var = m.group(2)
-                seen[var] = seen.get(var, 0) + 1
-                if var not in first_line:
-                    first_line[var] = ln.line
-            for var, cnt in seen.items():
-                if cnt > 1:
-                    hits.append((f"{file}:{first_line[var]}", f"same pointer '{var}' freed {cnt} times in changed lines", ""))
+                if func_re.match(ln.text.lstrip()) and '{' not in ln.text:
+                    if cur_group:
+                        func_groups.append(cur_group)
+                    cur_group = [ln]
+                    cur_func_start = ln.line
+                else:
+                    cur_group.append(ln)
+            if cur_group:
+                func_groups.append(cur_group)
+            for group in func_groups:
+                seen_g: Dict[str, int] = {}
+                first_g: Dict[str, int] = {}
+                for ln in group:
+                    if re.match(r'^\s*(/\*|\*|//)', ln.text):
+                        continue
+                    m = free_re.search(ln.text)
+                    if not m:
+                        continue
+                    var = m.group(2)
+                    seen_g[var] = seen_g.get(var, 0) + 1
+                    if var not in first_g:
+                        first_g[var] = ln.line
+                for var, cnt in seen_g.items():
+                    if cnt > 1:
+                        hits.append((f"{file}:{first_g[var]}", f"same pointer '{var}' freed {cnt} times in same function scope", ""))
         return hits
 
     if agg == "missing_check_hint":
