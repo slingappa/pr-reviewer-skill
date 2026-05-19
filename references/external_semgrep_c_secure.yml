@@ -1,0 +1,56 @@
+rules:
+  - id: c.secure.api.strcpy
+    languages: [c, cpp]
+    severity: ERROR
+    message: "Avoid strcpy(): use a bounded copy API and explicit destination size checks."
+    metadata:
+      cwe: CWE-120
+      category: security
+      confidence: MEDIUM
+    pattern: strcpy($DST, $SRC)
+
+  - id: c.secure.api.strcat
+    languages: [c, cpp]
+    severity: ERROR
+    message: "Avoid strcat(): use bounded concatenation and validate remaining destination capacity."
+    metadata:
+      cwe: CWE-120
+      category: security
+      confidence: MEDIUM
+    pattern: strcat($DST, $SRC)
+
+  - id: c.secure.api.sprintf
+    languages: [c, cpp]
+    severity: ERROR
+    message: "Avoid sprintf()/vsprintf(): use snprintf()/vsnprintf() with explicit buffer size."
+    metadata:
+      cwe: CWE-120
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: sprintf($BUF, $FMT, ...)
+          - pattern: vsprintf($BUF, $FMT, $ARGS)
+
+  - id: c.secure.api.gets
+    languages: [c, cpp]
+    severity: ERROR
+    message: "Avoid gets(): it is unsafe and removed from modern C standards."
+    metadata:
+      cwe: CWE-242
+      category: security
+      confidence: HIGH
+    pattern: gets($BUF)
+
+  - id: c.secure.api.system-tainted
+    languages: [c, cpp]
+    severity: WARNING
+    message: "Review system()/popen() usage for command injection risk and argument sanitization."
+    metadata:
+      cwe: CWE-78
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: system($CMD)
+          - pattern: popen($CMD, $MODE)

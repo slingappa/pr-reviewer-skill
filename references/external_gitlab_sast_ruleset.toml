@@ -1,0 +1,6 @@
+[semgrep]
+description = "GitLab-style passthrough to local Semgrep secure C rules."
+
+[[semgrep.passthrough]]
+type = "path"
+value = "external_semgrep_c_secure.yml"
