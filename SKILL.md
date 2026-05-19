@@ -291,6 +291,11 @@ Rule reference for bug-model-only mode:
 - Auto-detection sources for installed model bundles:
   - `~/.config/pr-reviewer-skill/bug-model.env`
   - `ml-bug-feature-models/current`
+- `bug-model.env` supports repo-specific keys:
+  - `BUG_MODEL_PATH_LINUX` / `BUG_SCORER_CMD_LINUX`
+  - `BUG_MODEL_PATH_EDK2` / `BUG_SCORER_CMD_EDK2`
+  - falls back to generic `BUG_MODEL_PATH` / `BUG_SCORER_CMD`.
+- Frozen Linux+EDK2 review bundle: `/usr2/slingapp/workspace/ml_models/linux-edk2-refined-v0.9.2`.
 
 Vulnerability-rule lifecycle scripts:
 ```bash

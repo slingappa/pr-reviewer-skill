@@ -158,6 +158,12 @@ git -C /abs/path/to/local/repo switch -c pr-<number>-review
 - If `ml-bug-feature-models` is installed (`./install.sh` in that repo), this script auto-detects model/scorer from:
   - `~/.config/pr-reviewer-skill/bug-model.env`, or
   - `ml-bug-feature-models/current`.
+- `bug-model.env` supports repo-specific keys:
+  - `BUG_MODEL_PATH_LINUX` / `BUG_SCORER_CMD_LINUX`
+  - `BUG_MODEL_PATH_EDK2` / `BUG_SCORER_CMD_EDK2`
+  - falls back to generic `BUG_MODEL_PATH` / `BUG_SCORER_CMD`.
+- Frozen Linux+EDK2 release used in current evaluation:
+  - `/usr2/slingapp/workspace/ml_models/linux-edk2-refined-v0.9.2`
 - Do not auto-submit proposed comments; a human must approve/edit each before posting.
 - Always start by creating a new local branch dedicated to this review task.
 - Do not add `Signed-off-by:` automatically; final signoff must always be done by a human.

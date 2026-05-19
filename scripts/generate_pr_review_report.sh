@@ -23,6 +23,9 @@ Options:
   --bug-binary-threshold <n> Binary risk threshold for model gating (default: 0.45)
   --bug-family-threshold <n> Bug family threshold for model gating (default: 0.35)
   --bug-hunk-threshold <n> Hunk/localization threshold for model gating (default: 0.35)
+  --bug-high-risk-fallback-threshold <n> Inject a high-risk fallback draft comment when model is actual-bug but all line comments are filtered (default: 0.90)
+  --bug-guarded-risk-min-hunk <n> Min top-hunk confidence to anchor risk-only manual-check comments to file:line (default: 0.20)
+  --bug-risk-only-fallback-threshold <n> Optional fallback for risk-only mode when all line comments are filtered (disabled by default)
   --bug-topk-hunks <n>  Number of top hunks to request from model scorer (default: 5)
   --ruleset <name>      Rule selection: all|repo-bug-model-rules (default: all)
   --no-fetch-checkpatch Disable remote fetch fallback when local checker is missing
@@ -31,6 +34,36 @@ Options:
   --report-file <file>  Overwrite this report file directly
   --include-clean       Include explicit low-severity clean findings when no blockers are detected
   -h, --help            Show help
+
+Environment (optional model auto-detect override):
+  BUG_MODEL_PATH=/abs/path/to/default_model.joblib
+  BUG_SCORER_CMD=/abs/path/to/install.sh --score-pairwise
+  BUG_MODEL_PATH_<REPO>=/abs/path/to/repo_specific_model.joblib   (example: BUG_MODEL_PATH_LINUX, BUG_MODEL_PATH_EDK2)
+  BUG_SCORER_CMD_<REPO>=/abs/path/to/install.sh --score-pairwise
+
+Environment (optional external YAML rules):
+  EXTERNAL_YAML_ENGINE=semgrep
+  EXTERNAL_YAML_CONFIG=/abs/path/to/semgrep_rules.yml
+  EXTERNAL_GITLAB_SAST_RULESET=/abs/path/to/sast-ruleset.toml
+  EXTERNAL_DATADOG_RULES=/abs/path/to/datadog_rules.yml
+  EXTERNAL_YAML_WINDOW=3
+  EXTERNAL_YAML_SEMGREP_SCAN_TIMEOUT_SEC=45
+  EXTERNAL_YAML_SEMGREP_RULE_TIMEOUT_SEC=3
+  EXTERNAL_YAML_SEMGREP_TIMEOUT_THRESHOLD=1
+  EXTERNAL_YAML_SEMGREP_MAX_TARGET_BYTES=1000000
+  EXTERNAL_YAML_SEMGREP_JOBS=4
+  EXTERNAL_YAML_CLANG_TIDY_CHECKS=clang-analyzer-*,cert-*,cppcoreguidelines-*
+  EXTERNAL_YAML_CLANG_TIDY_TIMEOUT_SEC=30
+  EXTERNAL_YAML_BEARER_TIMEOUT_SEC=45
+  EXTERNAL_CODEQL_DB=/abs/path/to/codeql_db
+  EXTERNAL_CODEQL_QUERY_SUITE=codeql/cpp-queries:codeql-suites/cpp-security-and-quality.qls
+  EXTERNAL_CODEQL_TIMEOUT_SEC=180
+  EXTERNAL_CODEQL_CACHE_DIR=/tmp/pr-reviewer-codeql-cache
+  EXTERNAL_CODEQL_CACHE_DISABLE=0
+  DIFF_NATIVE_HEURISTICS=1
+  DIFF_NATIVE_WINDOW=12
+  DIFF_NATIVE_MAX_FINDINGS=12
+  DIFF_NATIVE_STRICT=0
 USAGE
 }
 
@@ -58,6 +91,9 @@ bug_scorer_cmd=""
 bug_binary_threshold="0.45"
 bug_family_threshold="0.35"
 bug_hunk_threshold="0.35"
+bug_high_risk_fallback_threshold="0.90"
+bug_guarded_risk_min_hunk="0.20"
+bug_risk_only_fallback_threshold=""
 bug_topk_hunks=5
 ruleset_mode="all"
 allow_scope_mismatch=0
@@ -123,6 +159,18 @@ while [[ $# -gt 0 ]]; do
       bug_hunk_threshold="${2:-0.35}"
       shift 2
       ;;
+    --bug-high-risk-fallback-threshold)
+      bug_high_risk_fallback_threshold="${2:-0.90}"
+      shift 2
+      ;;
+    --bug-guarded-risk-min-hunk)
+      bug_guarded_risk_min_hunk="${2:-0.20}"
+      shift 2
+      ;;
+    --bug-risk-only-fallback-threshold)
+      bug_risk_only_fallback_threshold="${2:-}"
+      shift 2
+      ;;
     --bug-topk-hunks)
       bug_topk_hunks="${2:-5}"
       shift 2
@@ -186,6 +234,11 @@ esac
 [[ "$bug_binary_threshold" =~ ^[0-9]+(\.[0-9]+)?$ ]] || err "Invalid --bug-binary-threshold: $bug_binary_threshold"
 [[ "$bug_family_threshold" =~ ^[0-9]+(\.[0-9]+)?$ ]] || err "Invalid --bug-family-threshold: $bug_family_threshold"
 [[ "$bug_hunk_threshold" =~ ^[0-9]+(\.[0-9]+)?$ ]] || err "Invalid --bug-hunk-threshold: $bug_hunk_threshold"
+[[ "$bug_high_risk_fallback_threshold" =~ ^[0-9]+(\.[0-9]+)?$ ]] || err "Invalid --bug-high-risk-fallback-threshold: $bug_high_risk_fallback_threshold"
+[[ "$bug_guarded_risk_min_hunk" =~ ^[0-9]+(\.[0-9]+)?$ ]] || err "Invalid --bug-guarded-risk-min-hunk: $bug_guarded_risk_min_hunk"
+if [[ -n "$bug_risk_only_fallback_threshold" ]]; then
+  [[ "$bug_risk_only_fallback_threshold" =~ ^[0-9]+(\.[0-9]+)?$ ]] || err "Invalid --bug-risk-only-fallback-threshold: $bug_risk_only_fallback_threshold"
+fi
 case "$ruleset_mode" in
   all|repo-bug-model-rules) ;;
   *) err "Invalid --ruleset: $ruleset_mode (use all|repo-bug-model-rules)" ;;
@@ -390,6 +443,7 @@ rule_matrix_md="$tmp_dir/rule_matrix.md"
 proposed_comments_md="$tmp_dir/proposed_comments.md"
 proposed_comments_seen="$tmp_dir/proposed_comments.seen"
 proposed_comments_tsv="$tmp_dir/proposed_comments.tsv"
+model_comment_locations_txt="$tmp_dir/model_comment_locations.txt"
 comment_filter_rejects_tsv="$tmp_dir/comment_filter_rejects.tsv"
 added_line_keys_txt="$tmp_dir/added_line_keys.txt"
 comment_batches_md="$tmp_dir/comment_batches.md"
@@ -401,7 +455,13 @@ changed_c_files_txt="$tmp_dir/changed_c_files.txt"
 kernel_vuln_rules_json="$script_dir/../references/kernel_vuln_rules.json"
 kernel_vuln_raw_tsv="$tmp_dir/kernel_vuln_raw.tsv"
 kernel_vuln_log="$tmp_dir/kernel_vuln.log"
+flawfinder_log="$tmp_dir/flawfinder.log"
+flawfinder_raw_tsv="$tmp_dir/flawfinder_raw.tsv"
+external_yaml_log="$tmp_dir/external_yaml.log"
+external_yaml_raw_tsv="$tmp_dir/external_yaml_raw.tsv"
 added_lines_tsv="$tmp_dir/added_lines.tsv"
+deleted_lines_tsv="$tmp_dir/deleted_lines.tsv"
+diff_native_checked_calls_tsv="$tmp_dir/diff_native_checked_calls.tsv"
 pr_files_txt="$tmp_dir/pr_files.txt"
 local_files_txt="$tmp_dir/local_files.txt"
 bug_model_json="$tmp_dir/bug_model.json"
@@ -417,6 +477,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 : > "$proposed_comments_md"
 : > "$proposed_comments_seen"
 : > "$proposed_comments_tsv"
+: > "$model_comment_locations_txt"
 : > "$comment_filter_rejects_tsv"
 : > "$added_line_keys_txt"
 : > "$comment_batches_md"
@@ -427,7 +488,13 @@ trap 'rm -rf "$tmp_dir"' EXIT
 : > "$changed_c_files_txt"
 : > "$kernel_vuln_raw_tsv"
 : > "$kernel_vuln_log"
+: > "$flawfinder_log"
+: > "$flawfinder_raw_tsv"
+: > "$external_yaml_log"
+: > "$external_yaml_raw_tsv"
 : > "$added_lines_tsv"
+: > "$deleted_lines_tsv"
+: > "$diff_native_checked_calls_tsv"
 : > "$pr_files_txt"
 : > "$local_files_txt"
 : > "$bug_model_json"
@@ -435,6 +502,102 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 kernel_vuln_rules_ran=0
 kernel_vuln_findings_total=0
+flawfinder_ran=0
+flawfinder_findings_total=0
+flawfinder_findings_pre_filter=0
+flawfinder_findings_windowed=0
+flawfinder_findings_deduped=0
+flawfinder_findings_emitted=0
+external_yaml_engine="${EXTERNAL_YAML_ENGINE:-off}"
+external_yaml_engine="$(printf '%s' "$external_yaml_engine" | tr '[:upper:]' '[:lower:]')"
+external_yaml_config="${EXTERNAL_YAML_CONFIG:-}"
+if [[ -z "$external_yaml_config" && ( "$external_yaml_engine" == "semgrep" || "$external_yaml_engine" == "gitlab_sast" || "$external_yaml_engine" == "gitlab-sast" || "$external_yaml_engine" == "gitlab" || "$external_yaml_engine" == "gitlab_sast_passthrough" || "$external_yaml_engine" == "datadog" || "$external_yaml_engine" == "datadog_custom_rules" || "$external_yaml_engine" == "datadog-custom-rules" ) ]]; then
+  external_yaml_config="$script_dir/../references/external_semgrep_c_secure.yml"
+fi
+external_yaml_config_display="$external_yaml_config"
+declare -a external_yaml_config_list=()
+IFS=',' read -r -a _external_yaml_cfg_parts <<< "$external_yaml_config"
+for _cfg in "${_external_yaml_cfg_parts[@]}"; do
+  _cfg_trimmed="$(printf '%s' "$_cfg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [[ -n "$_cfg_trimmed" ]] || continue
+  external_yaml_config_list+=("$_cfg_trimmed")
+done
+if [[ "${#external_yaml_config_list[@]}" -eq 0 && ( "$external_yaml_engine" == "semgrep" || "$external_yaml_engine" == "gitlab_sast" || "$external_yaml_engine" == "gitlab-sast" || "$external_yaml_engine" == "gitlab" || "$external_yaml_engine" == "gitlab_sast_passthrough" || "$external_yaml_engine" == "datadog" || "$external_yaml_engine" == "datadog_custom_rules" || "$external_yaml_engine" == "datadog-custom-rules" ) ]]; then
+  external_yaml_config_list=("$script_dir/../references/external_semgrep_c_secure.yml")
+  external_yaml_config_display="${external_yaml_config_list[0]}"
+elif [[ "${#external_yaml_config_list[@]}" -gt 0 ]]; then
+  external_yaml_config_display="$(printf '%s' "${external_yaml_config_list[*]}" | tr ' ' ',')"
+else
+  external_yaml_config_display="(none)"
+fi
+external_yaml_window="${EXTERNAL_YAML_WINDOW:-3}"
+if [[ ! "$external_yaml_window" =~ ^[0-9]+$ ]]; then
+  external_yaml_window=3
+fi
+external_yaml_semgrep_scan_timeout_sec="${EXTERNAL_YAML_SEMGREP_SCAN_TIMEOUT_SEC:-45}"
+if [[ ! "$external_yaml_semgrep_scan_timeout_sec" =~ ^[0-9]+$ ]]; then
+  external_yaml_semgrep_scan_timeout_sec=45
+fi
+external_yaml_semgrep_rule_timeout_sec="${EXTERNAL_YAML_SEMGREP_RULE_TIMEOUT_SEC:-3}"
+if [[ ! "$external_yaml_semgrep_rule_timeout_sec" =~ ^[0-9]+$ ]]; then
+  external_yaml_semgrep_rule_timeout_sec=3
+fi
+external_yaml_semgrep_timeout_threshold="${EXTERNAL_YAML_SEMGREP_TIMEOUT_THRESHOLD:-1}"
+if [[ ! "$external_yaml_semgrep_timeout_threshold" =~ ^[0-9]+$ ]]; then
+  external_yaml_semgrep_timeout_threshold=1
+fi
+external_yaml_semgrep_max_target_bytes="${EXTERNAL_YAML_SEMGREP_MAX_TARGET_BYTES:-1000000}"
+if [[ ! "$external_yaml_semgrep_max_target_bytes" =~ ^[0-9]+$ ]]; then
+  external_yaml_semgrep_max_target_bytes=1000000
+fi
+external_yaml_semgrep_jobs="${EXTERNAL_YAML_SEMGREP_JOBS:-4}"
+if [[ ! "$external_yaml_semgrep_jobs" =~ ^[0-9]+$ ]] || [[ "$external_yaml_semgrep_jobs" -lt 1 ]]; then
+  external_yaml_semgrep_jobs=4
+fi
+external_yaml_clang_tidy_checks="${EXTERNAL_YAML_CLANG_TIDY_CHECKS:-clang-analyzer-*,cert-*,cppcoreguidelines-*}"
+external_yaml_clang_tidy_timeout_sec="${EXTERNAL_YAML_CLANG_TIDY_TIMEOUT_SEC:-30}"
+if [[ ! "$external_yaml_clang_tidy_timeout_sec" =~ ^[0-9]+$ ]] || [[ "$external_yaml_clang_tidy_timeout_sec" -lt 1 ]]; then
+  external_yaml_clang_tidy_timeout_sec=30
+fi
+external_yaml_bearer_timeout_sec="${EXTERNAL_YAML_BEARER_TIMEOUT_SEC:-45}"
+if [[ ! "$external_yaml_bearer_timeout_sec" =~ ^[0-9]+$ ]] || [[ "$external_yaml_bearer_timeout_sec" -lt 1 ]]; then
+  external_yaml_bearer_timeout_sec=45
+fi
+external_yaml_gitlab_ruleset="${EXTERNAL_GITLAB_SAST_RULESET:-}"
+external_yaml_datadog_rules="${EXTERNAL_DATADOG_RULES:-}"
+external_yaml_codeql_db="${EXTERNAL_CODEQL_DB:-}"
+external_yaml_codeql_query_suite="${EXTERNAL_CODEQL_QUERY_SUITE:-codeql/cpp-queries:codeql-suites/cpp-security-and-quality.qls}"
+external_yaml_codeql_timeout_sec="${EXTERNAL_CODEQL_TIMEOUT_SEC:-180}"
+if [[ ! "$external_yaml_codeql_timeout_sec" =~ ^[0-9]+$ ]] || [[ "$external_yaml_codeql_timeout_sec" -lt 1 ]]; then
+  external_yaml_codeql_timeout_sec=180
+fi
+external_yaml_codeql_cache_dir="${EXTERNAL_CODEQL_CACHE_DIR:-/tmp/pr-reviewer-codeql-cache}"
+external_yaml_codeql_cache_disable="${EXTERNAL_CODEQL_CACHE_DISABLE:-0}"
+if [[ "$external_yaml_codeql_cache_disable" != "0" && "$external_yaml_codeql_cache_disable" != "1" ]]; then
+  external_yaml_codeql_cache_disable=0
+fi
+diff_native_heuristics="${DIFF_NATIVE_HEURISTICS:-0}"
+if [[ "$diff_native_heuristics" != "0" && "$diff_native_heuristics" != "1" ]]; then
+  diff_native_heuristics=0
+fi
+diff_native_window="${DIFF_NATIVE_WINDOW:-12}"
+if [[ ! "$diff_native_window" =~ ^[0-9]+$ ]]; then
+  diff_native_window=12
+fi
+diff_native_max_findings="${DIFF_NATIVE_MAX_FINDINGS:-12}"
+if [[ ! "$diff_native_max_findings" =~ ^[0-9]+$ ]] || [[ "$diff_native_max_findings" -lt 1 ]]; then
+  diff_native_max_findings=12
+fi
+diff_native_strict="${DIFF_NATIVE_STRICT:-0}"
+if [[ "$diff_native_strict" != "0" && "$diff_native_strict" != "1" ]]; then
+  diff_native_strict=0
+fi
+external_yaml_ran=0
+external_yaml_findings_total=0
+external_yaml_findings_pre_filter=0
+external_yaml_findings_windowed=0
+external_yaml_findings_deduped=0
+external_yaml_findings_emitted=0
 bug_model_ran=0
 bug_model_status="not-run"
 bug_model_review_mode=""
@@ -446,6 +609,8 @@ bug_model_hunk_file=""
 bug_model_hunk_line=""
 bug_model_memory_used="false"
 bug_model_source="unset"
+bug_model_fallback_injected=0
+bug_model_risk_fallback_injected=0
 
 # Build changed file rows.
 jq -r '.[] | [(.filename // ""), (.status // ""), ((.additions // 0)|tostring), ((.deletions // 0)|tostring)] | @tsv' "$files_json" | \
@@ -498,6 +663,39 @@ in_hunk {
   line++
 }
 ' > "$added_lines_tsv"
+
+# Parse deleted patch lines (old-file line numbers) for diff-native heuristics.
+git -C "$repo_dir" diff -U0 "$base_ref...$head_ref" | \
+awk '
+BEGIN { file=""; line=0; in_hunk=0; OFS="\t" }
+/^diff --git / {
+  in_hunk=0
+  file=$4
+  sub(/^b\//, "", file)
+  next
+}
+/^@@ / {
+  in_hunk=1
+  if (match($0, /-([0-9]+)/, m)) {
+    line=m[1]
+  } else {
+    line=0
+  }
+  next
+}
+in_hunk && /^\+\+\+/ { next }
+in_hunk && /^---/ { next }
+in_hunk && /^-/ {
+  txt=substr($0,2)
+  print file, line, txt
+  line++
+  next
+}
+in_hunk && /^\+/ { next }
+in_hunk {
+  line++
+}
+' > "$deleted_lines_tsv"
 
 awk -F'\t' 'NF >= 2 && $1 != "" && $2 ~ /^[0-9]+$/ {print $1 ":" $2}' "$added_lines_tsv" | sort -u > "$added_line_keys_txt"
 
@@ -574,6 +772,12 @@ line_has_sync_tokens() {
   local src="$1"
   printf '%s\n' "$src" | grep -Eiq '\b(lock|unlock|mutex|spin|rwsem|semaphore|rcu|atomic|barrier|READ_ONCE|WRITE_ONCE|lockless|timer|work|queue|irq|preempt|wakeup|wait|completion|flush|cancel|stop|race|deadlock)\b' && return 0
   return 1
+}
+
+float_ge() {
+  local lhs="$1"
+  local rhs="$2"
+  awk -v a="$lhs" -v b="$rhs" 'BEGIN { exit ((a + 0.0) >= (b + 0.0) ? 0 : 1) }'
 }
 
 comment_gate_reason=""
@@ -682,6 +886,12 @@ comment_passes_precision_gates() {
   key="${file}:${line}"
 
   if ! is_code_file_for_review_comment "$file"; then
+    if [[ "$rule_id" == "ML-PAIRWISE-DETECTOR" || "$rule_id" == "REPO-BUG-MODEL-RULE-1" ]]; then
+      if [[ "${bug_model_review_mode:-}" == "actual-bug" || "${bug_model_review_mode:-}" == "actual-bug-lite" ]] && float_ge "${bug_model_risk_score:-0}" "$bug_high_risk_fallback_threshold"; then
+        comment_gate_resolved_line="$line"
+        return 0
+      fi
+    fi
     comment_gate_reason="non-code-file"
     return 1
   fi
@@ -689,6 +899,25 @@ comment_passes_precision_gates() {
   lower="$(printf '%s %s' "$evidence" "$rule_id" | tr '[:upper:]' '[:lower:]')"
   if [[ "$lower" == *"confidence=low"* ]]; then
     comment_gate_reason="low-confidence-signal"
+    return 1
+  fi
+
+  # Static-analysis findings: use the exact reported line without re-anchoring.
+  # Require strict proximity to changed lines to keep findings actionable.
+  if [[ "$rule_id" == FF-* || "$rule_id" == SG-* ]]; then
+    local static_window=3
+    if [[ "$rule_id" == SG-* ]]; then
+      static_window="$external_yaml_window"
+    fi
+    source_line="$(source_line_for_location "$file" "$line")"
+    if ! is_non_actionable_source_line "$source_line"; then
+      nearest="$(list_candidate_changed_lines "$file" "$line" "$static_window" || true)"
+      if [[ -n "$nearest" ]]; then
+        comment_gate_resolved_line="$line"
+        return 0
+      fi
+    fi
+    comment_gate_reason="not-on-changed-line"
     return 1
   fi
 
@@ -783,6 +1012,9 @@ maybe_add_proposed_comment() {
     return 1
   fi
   echo "$key" >> "$proposed_comments_seen"
+  if [[ "$rule_id" == "REPO-BUG-MODEL-RULE-1" || "$rule_id" == "ML-PAIRWISE-DETECTOR" ]]; then
+    echo "${file}:${line}" >> "$model_comment_locations_txt"
+  fi
 
   if [[ "$rule_id" == "REPO-BUG-MODEL-RULE-1" || "$rule_id" == "ML-PAIRWISE-DETECTOR" ]]; then
     preferred_msg="$(build_model_precise_comment "$file" "$line" "$evidence" "$action" || true)"
@@ -950,14 +1182,31 @@ strip_optional_quotes() {
   printf '%s' "$value"
 }
 
+repo_model_env_suffix() {
+  local repo_name=""
+  repo_name="$(basename "${repo_dir:-}")"
+  repo_name="$(printf '%s' "$repo_name" | tr '[:lower:].-' '[:upper:]__' | tr -cd 'A-Z0-9_')"
+  printf '%s' "$repo_name"
+}
+
 load_bug_model_from_env_file() {
   local env_file="$1"
   local env_model=""
   local env_scorer=""
+  local repo_suffix=""
   [[ -f "$env_file" ]] || return 1
 
-  env_model="$(sed -n 's/^BUG_MODEL_PATH=//p' "$env_file" | head -n1 || true)"
-  env_scorer="$(sed -n 's/^BUG_SCORER_CMD=//p' "$env_file" | head -n1 || true)"
+  repo_suffix="$(repo_model_env_suffix)"
+  if [[ -n "$repo_suffix" ]]; then
+    env_model="$(sed -n "s/^BUG_MODEL_PATH_${repo_suffix}=//p" "$env_file" | head -n1 || true)"
+    env_scorer="$(sed -n "s/^BUG_SCORER_CMD_${repo_suffix}=//p" "$env_file" | head -n1 || true)"
+  fi
+  if [[ -z "$env_model" ]]; then
+    env_model="$(sed -n 's/^BUG_MODEL_PATH=//p' "$env_file" | head -n1 || true)"
+  fi
+  if [[ -z "$env_scorer" ]]; then
+    env_scorer="$(sed -n 's/^BUG_SCORER_CMD=//p' "$env_file" | head -n1 || true)"
+  fi
   env_model="$(strip_optional_quotes "$env_model")"
   env_scorer="$(strip_optional_quotes "$env_scorer")"
 
@@ -994,6 +1243,9 @@ resolve_bug_model_defaults() {
   local env_file=""
   local root=""
   local bundle_dir=""
+  local repo_suffix=""
+  local env_repo_model_key=""
+  local env_repo_scorer_key=""
 
   if [[ -n "$bug_model_path" ]]; then
     if [[ -f "$bug_model_path" ]]; then
@@ -1004,6 +1256,20 @@ resolve_bug_model_defaults() {
     fi
     bug_model_source="cli-missing"
     return 1
+  fi
+
+  repo_suffix="$(repo_model_env_suffix)"
+  if [[ -n "$repo_suffix" ]]; then
+    env_repo_model_key="BUG_MODEL_PATH_${repo_suffix}"
+    env_repo_scorer_key="BUG_SCORER_CMD_${repo_suffix}"
+    if [[ -n "${!env_repo_model_key:-}" && -f "${!env_repo_model_key}" ]]; then
+      bug_model_path="${!env_repo_model_key}"
+      if [[ -z "$bug_scorer_cmd" && -n "${!env_repo_scorer_key:-}" ]]; then
+        bug_scorer_cmd="${!env_repo_scorer_key}"
+      fi
+      bug_model_source="env:${env_repo_model_key}"
+      return 0
+    fi
   fi
 
   if [[ -n "${BUG_MODEL_PATH:-}" && -f "${BUG_MODEL_PATH}" ]]; then
@@ -1083,6 +1349,76 @@ resolve_bug_scorer_cmd() {
   return 1
 }
 
+inject_high_risk_model_fallback_comment() {
+  local file=""
+  local line=""
+  local key=""
+  local msg=""
+
+  bug_model_fallback_injected=0
+  [[ -s "$proposed_comments_tsv" ]] && return 0
+  [[ "$bug_model_status" == "ok" ]] || return 0
+  [[ "$bug_model_review_mode" == "actual-bug" || "$bug_model_review_mode" == "actual-bug-lite" ]] || return 0
+  if ! float_ge "${bug_model_risk_score:-0}" "$bug_high_risk_fallback_threshold"; then
+    return 0
+  fi
+
+  file="${bug_model_hunk_file:-model-scorer}"
+  line="${bug_model_hunk_line:-1}"
+  [[ "$line" =~ ^[0-9]+$ ]] || line=1
+  key="${file}:${line}|correctness|high-risk-model-fallback|ML-PAIRWISE-FALLBACK|https://github.com/slingappa/ml-bug-feature-extractor"
+  if grep -Fqx "$key" "$proposed_comments_seen"; then
+    return 0
+  fi
+  echo "$key" >> "$proposed_comments_seen"
+  echo "${file}:${line}" >> "$model_comment_locations_txt"
+  msg="High-risk model alert: actual-bug mode with risk=${bug_model_risk_score}. Line-level candidates were filtered; perform targeted manual validation on ${file}:${line} before approval. Rule: ML-PAIRWISE-FALLBACK. Source: https://github.com/slingappa/ml-bug-feature-extractor."
+  {
+    echo "- [ ] HIGH | ${file}:${line}"
+    echo "  - Draft comment: ${msg}"
+  } >> "$proposed_comments_md"
+  printf '%s\t%s\t%s\t%s\n' "high" "$file" "$line" "$msg" >> "$proposed_comments_tsv"
+  bug_model_fallback_injected=1
+}
+
+inject_risk_only_model_fallback_comment() {
+  local file=""
+  local line=""
+  local key=""
+  local msg=""
+
+  bug_model_risk_fallback_injected=0
+  [[ -n "$bug_risk_only_fallback_threshold" ]] || return 0
+  [[ -s "$proposed_comments_tsv" ]] && return 0
+  [[ "$bug_model_status" == "ok" ]] || return 0
+  [[ "$bug_model_review_mode" == "risk-only" ]] || return 0
+  if ! float_ge "${bug_model_risk_score:-0}" "$bug_risk_only_fallback_threshold"; then
+    return 0
+  fi
+  if ! float_ge "${bug_model_best_hunk_score:-0}" "$bug_guarded_risk_min_hunk"; then
+    return 0
+  fi
+
+  file="${bug_model_hunk_file:-model-scorer}"
+  line="${bug_model_hunk_line:-1}"
+  [[ "$line" =~ ^[0-9]+$ ]] || line=1
+  key="${file}:${line}|correctness|risk-only-model-fallback|ML-PAIRWISE-RISK-FALLBACK|https://github.com/slingappa/ml-bug-feature-extractor"
+  if grep -Fqx "$key" "$proposed_comments_seen"; then
+    return 0
+  fi
+  echo "$key" >> "$proposed_comments_seen"
+  if [[ "$file" != "model-scorer" ]]; then
+    echo "${file}:${line}" >> "$model_comment_locations_txt"
+  fi
+  msg="Model risk-only fallback: risk=${bug_model_risk_score}, top_hunk=${bug_model_best_hunk_score}. No line-level comments survived precision gates; run targeted manual validation at ${file}:${line} before approval. Rule: ML-PAIRWISE-RISK-FALLBACK. Source: https://github.com/slingappa/ml-bug-feature-extractor."
+  {
+    echo "- [ ] MEDIUM | ${file}:${line}"
+    echo "  - Draft comment: ${msg}"
+  } >> "$proposed_comments_md"
+  printf '%s\t%s\t%s\t%s\n' "medium" "$file" "$line" "$msg" >> "$proposed_comments_tsv"
+  bug_model_risk_fallback_injected=1
+}
+
 run_repo_bug_model_rules_only() {
   local resolved_cmd=""
   local model_raw=""
@@ -1093,6 +1429,7 @@ run_repo_bug_model_rules_only() {
   local predicted_flag="false"
   local scorer_args=()
   local review_comments_out="$context_dir/review_comments.md"
+  local artifact_out_dir="$context_dir"
 
   if [[ "$ruleset_mode" != "repo-bug-model-rules" ]]; then
     return 0
@@ -1158,10 +1495,16 @@ run_repo_bug_model_rules_only() {
     location_text="${bug_model_hunk_file}:${bug_model_hunk_line}"
   fi
 
-  if [[ "$predicted_flag" == "true" && "$bug_model_review_mode" == "actual-bug" && -n "$bug_model_family" ]]; then
+  if [[ "$bug_model_review_mode" == "actual-bug" && -n "$bug_model_family" ]]; then
     add_finding "high" "correctness" "$location_text" \
       "Model-assisted detector predicts ${bug_model_family} (risk=${bug_model_risk_score}, family=${bug_model_family_score}, hunk=${bug_model_best_hunk_score}, mode=${bug_model_review_mode}, memory_used=${bug_model_memory_used})." \
       "Likely ${bug_model_family} defect in this patch." \
+      "$action_text" \
+      "REPO-BUG-MODEL-RULE-1" "references/repo-bug-model-rules.md"
+  elif [[ "$bug_model_review_mode" == "actual-bug-lite" && -n "$bug_model_family" ]]; then
+    add_finding "high" "correctness" "$location_text" \
+      "Model-assisted detector flagged ${bug_model_family} via lite gates (risk=${bug_model_risk_score}, family=${bug_model_family_score}, hunk=${bug_model_best_hunk_score}, mode=${bug_model_review_mode}, memory_used=${bug_model_memory_used})." \
+      "Likely ${bug_model_family} defect in this patch; family confidence is below strict gate but localization and risk are actionable." \
       "$action_text" \
       "REPO-BUG-MODEL-RULE-1" "references/repo-bug-model-rules.md"
   elif [[ "$predicted_flag" == "true" ]]; then
@@ -1177,6 +1520,9 @@ run_repo_bug_model_rules_only() {
       "Treat this as informational only and continue standard review." \
       "REPO-BUG-MODEL-RULE-3" "references/repo-bug-model-rules.md"
   fi
+
+  inject_high_risk_model_fallback_comment
+  inject_risk_only_model_fallback_comment
 
   {
     high_count="$(grep -Ec '^### F[0-9]+ - HIGH - ' "$findings_md" || true)"
@@ -1265,13 +1611,18 @@ run_repo_bug_model_rules_only() {
   if [[ -n "$report_file" ]]; then
     cp "$report_md" "$report_file"
     review_comments_out="$(dirname "$report_file")/review_comments.md"
+    artifact_out_dir="$(dirname "$report_file")"
   elif [[ -n "$output_file" ]]; then
     cp "$report_md" "$output_file"
     review_comments_out="$(dirname "$output_file")/review_comments.md"
+    artifact_out_dir="$(dirname "$output_file")"
   else
     cat "$report_md"
   fi
   cp "$review_comments_md" "$review_comments_out"
+  if [[ "$flawfinder_ran" -eq 1 ]]; then
+    cp "$flawfinder_raw_tsv" "$artifact_out_dir/flawfinder_findings.tsv"
+  fi
   exit 0
 }
 
@@ -1306,6 +1657,129 @@ done < <(awk -F'\t' '
 ($3 ~ /\<(snprintf|vsnprintf|read|write|recv|send|fread|fwrite|close|pthread_mutex_lock|pthread_mutex_unlock)\s*\(/ &&
  $3 !~ /=/ && $3 !~ /if[[:space:]]*\(/ && $3 !~ /return[[:space:]]/) {print $1 "\t" $2 "\t" $3}
 ' "$added_lines_tsv" | sed -n '1,12p')
+
+if [[ "$diff_native_heuristics" == "1" ]]; then
+  # Diff-native: detect deleted/relaxed guards and anchor findings to nearby added lines.
+  while IFS=$'\t' read -r file old_line old_text; do
+    [[ -n "$file" && "$old_line" =~ ^[0-9]+$ ]] || continue
+    case "$file" in
+      *.c|*.h|*.cc|*.cpp|*.cxx|*.hpp|*.hh) ;;
+      *)
+        continue
+        ;;
+    esac
+    anchor_line="$(list_candidate_changed_lines "$file" "$old_line" "$diff_native_window" | head -n1 || true)"
+    [[ "$anchor_line" =~ ^[0-9]+$ ]] || continue
+    if [[ "$diff_native_strict" == "1" ]]; then
+      anchor_text="$(awk -F'\t' -v f="$file" -v l="$anchor_line" '($1==f && $2==l){print $3; exit}' "$added_lines_tsv")"
+      if ! printf '%s\n' "$anchor_text" | grep -Eqi '(\->|\[[^]]+\]|<[[:space:]]*[[:alnum:]_]+|>[[:space:]]*[[:alnum:]_]+|\b[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(|\b(memcpy|memmove|strcpy|strncpy|EFI_ERROR|IS_ERR|IS_ERR_OR_NULL)\b)'; then
+        continue
+      fi
+    fi
+    has_replacement_guard="$(awk -F'\t' -v f="$file" -v l="$anchor_line" '
+($1 == f && $2 ~ /^[0-9]+$/) {
+  d = $2 - l
+  if (d < 0) d = -d
+  if (d <= 2 && $3 ~ /(if[[:space:]]*\(|WARN_ON|BUG_ON|IS_ERR|IS_ERR_OR_NULL|<=|>=|==|!=|<[[:space:]]*[[:alnum:]_]|>[[:space:]]*[[:alnum:]_]/)) {
+    found = 1
+  }
+}
+END { print (found ? "1" : "0") }
+' "$added_lines_tsv")"
+    if [[ "$has_replacement_guard" == "1" ]]; then
+      continue
+    fi
+    loc="${file}:${anchor_line}"
+    add_finding "high" "correctness" "$loc" \
+      "Potential deleted/relaxed safety guard near changed code. Removed line: ${old_text}" \
+      "Removed validation/guard logic can re-open null/bounds/state safety regressions." \
+      "Reintroduce equivalent guard semantics near the modified path and add regression coverage for the removed condition." \
+      "LNX-DIFF-GUARD-RELAX" "https://www.kernel.org/doc/html/latest/process/coding-style.html"
+  done < <(awk -F'\t' '
+($3 ~ /\bif[[:space:]]*\(/ &&
+ $3 ~ /(!|NULL|IS_ERR|IS_ERR_OR_NULL|<=|>=|==|!=|<[[:space:]]*[[:alnum:]_]|>[[:space:]]*[[:alnum:]_]|WARN_ON|BUG_ON|return|goto)/) ||
+($3 ~ /(WARN_ON|BUG_ON|IS_ERR|IS_ERR_OR_NULL)[[:space:]]*\(/) ||
+($3 ~ /\b(return|goto)[[:space:]]+/ && $3 ~ /(-E[A-Z0-9_]+|NULL|false|0)/) {
+  print $1 "\t" $2 "\t" $3
+}
+' "$deleted_lines_tsv" | sed -n "1,${diff_native_max_findings}p")
+
+  # Diff-native: detect changed call sites where prior checked status handling was dropped.
+  awk -F'\t' '
+function is_comment_line(s,    t) {
+  t = s
+  gsub(/^[[:space:]]+/, "", t)
+  return (t ~ /^(\/\/|\/\*|\*|#|@)/)
+}
+function valid_call_name(n) {
+  if (n == "" || n ~ /^(if|for|while|switch|return|sizeof)$/) return 0
+  if (n ~ /^[A-Z0-9_]+$/) return 0
+  return 1
+}
+function extract_call(s,   t, m) {
+  t = s
+  if (match(t, /([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\(/, m)) return m[1]
+  return ""
+}
+{
+  if (is_comment_line($3)) next
+  if ($1 !~ /\.(c|h|cc|cpp|cxx|hpp|hh)$/) next
+  call = extract_call($3)
+  if (!valid_call_name(call)) next
+  if ($3 ~ /if[[:space:]]*\(.*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(/ || $3 ~ /=[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(/ || $3 ~ /return[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(/) {
+    print $1 "\t" call
+  }
+}
+' "$deleted_lines_tsv" | sort -u > "$diff_native_checked_calls_tsv"
+
+  diff_native_unchecked_emitted=0
+  while IFS=$'\t' read -r file line text call; do
+    [[ -n "$file" && "$line" =~ ^[0-9]+$ && -n "$call" ]] || continue
+    case "$file" in
+      *.c|*.h|*.cc|*.cpp|*.cxx|*.hpp|*.hh) ;;
+      *)
+        continue
+        ;;
+    esac
+    if ! grep -Fqx -- "$(printf '%s\t%s' "$file" "$call")" "$diff_native_checked_calls_tsv"; then
+      continue
+    fi
+    loc="${file}:${line}"
+    add_finding "medium" "correctness" "$loc" \
+      "Changed call site may have dropped prior status handling for '${call}': ${text}" \
+      "Unchecked failures can silently propagate corrupted state and hide root-cause signals." \
+      "Capture and validate '${call}' return status (or equivalent error indicator) before continuing control flow." \
+      "LNX-DIFF-UNCHECKED-RET" "https://go.dev/wiki/CodeReviewComments#handle-errors"
+    diff_native_unchecked_emitted=$((diff_native_unchecked_emitted + 1))
+    if [[ "$diff_native_unchecked_emitted" -ge "$diff_native_max_findings" ]]; then
+      break
+    fi
+  done < <(awk -F'\t' '
+function is_comment_line(s,    t) {
+  t = s
+  gsub(/^[[:space:]]+/, "", t)
+  return (t ~ /^(\/\/|\/\*|\*|#|@)/)
+}
+function valid_call_name(n) {
+  if (n == "" || n ~ /^(if|for|while|switch|return|sizeof)$/) return 0
+  if (n ~ /^[A-Z0-9_]+$/) return 0
+  return 1
+}
+function extract_call(s,   t, m) {
+  t = s
+  if (match(t, /([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\(/, m)) return m[1]
+  return ""
+}
+{
+  if (is_comment_line($3)) next
+  if ($1 !~ /\.(c|h|cc|cpp|cxx|hpp|hh)$/) next
+  call = extract_call($3)
+  if (!valid_call_name(call)) next
+  if ($3 ~ /if[[:space:]]*\(/ || $3 ~ /^[[:space:]]*(for|while|switch)[[:space:]]*\(/ || $3 ~ /return[[:space:]]+/ || $3 ~ /=[^=]/) next
+  print $1 "\t" $2 "\t" $3 "\t" call
+}
+' "$added_lines_tsv")
+fi
 
 while IFS=$'\t' read -r file line text; do
   loc="${file}:${line}"
@@ -1585,6 +2059,587 @@ if command -v python3 >/dev/null 2>&1 && [[ -f "$kernel_vuln_rules_json" ]] && [
 fi
 
 # Existing reviewer comments are context by default; include as findings only when requested.
+# Flawfinder static analysis pass: runs on changed C/C++ source files and stores findings
+# for post-model deduplication before comment emission.
+if command -v flawfinder >/dev/null 2>&1; then
+  flawfinder_ran=1
+  flawfinder_minlevel="${FLAWFINDER_MINLEVEL:-4}"
+  all_ff_files="$(jq -r '.[] | .filename // empty' "$files_json" 2>/dev/null | grep -E '\.(c|h|cc|cpp|cxx|hpp|hh)$' | sort -u || true)"
+  if [[ -n "$all_ff_files" ]]; then
+    while IFS= read -r cfile; do
+      abs_file="$repo_dir/$cfile"
+      # Use head_ref version of the file for accurate line numbers
+      ff_tmp_file="$tmp_dir/ff_$(printf '%s' "$cfile" | tr '/' '_').c"
+      if git -C "$repo_dir" show "${head_ref}:${cfile}" > "$ff_tmp_file" 2>/dev/null; then
+        abs_file="$ff_tmp_file"
+      elif [[ ! -f "$abs_file" ]]; then
+        continue
+      fi
+      # Build set of added line numbers for strict diff-adjacency filtering (<= +/-3)
+      added_lines_for_file="$(awk -F'\t' -v f="$cfile" '$1==f && $2~/^[0-9]+$/ {print $2}' "$added_lines_tsv")"
+      [[ -n "$added_lines_for_file" ]] || continue
+      # Run flawfinder on the file, capture dataonly output
+      ff_out="$(flawfinder --dataonly --quiet --minlevel "$flawfinder_minlevel" --singleline "$abs_file" 2>>"$flawfinder_log" || true)"
+      [[ -n "$ff_out" ]] || continue
+      # Parse flawfinder output: file:line:col: [level] (CWE-NNN) message
+      while IFS= read -r ff_line; do
+        [[ -z "$ff_line" ]] && continue
+        ff_lineno="$(printf '%s' "$ff_line" | sed -n 's|^[^:]*:\([0-9]\+\):.*|\1|p')"
+        [[ "$ff_lineno" =~ ^[0-9]+$ ]] || continue
+        flawfinder_findings_pre_filter=$((flawfinder_findings_pre_filter + 1))
+        in_window=0
+        while IFS= read -r added_ln; do
+          delta=$(( ff_lineno - added_ln ))
+          [[ $delta -lt 0 ]] && delta=$(( -delta ))
+          if [[ $delta -le 3 ]]; then in_window=1; break; fi
+        done <<< "$added_lines_for_file"
+        [[ $in_window -eq 1 ]] || continue
+        flawfinder_findings_windowed=$((flawfinder_findings_windowed + 1))
+        # Extract CWE and level
+        ff_cwe="$(printf '%s' "$ff_line" | grep -oE 'CWE-[0-9]+' | head -1 || true)"
+        ff_level="$(printf '%s' "$ff_line" | grep -oE '\[([0-9])\]' | tr -d '[]' | head -1 || true)"
+        ff_msg="$(printf '%s' "$ff_line" | sed 's/^[^:]*:[0-9]*:[0-9]*:[[:space:]]*//' | sed 's/[[:space:]]*$//' | cut -c1-120)"
+        # Map level to severity
+        sev="medium"
+        [[ "$ff_level" -ge 4 ]] 2>/dev/null && sev="high"
+        rule_id="FF-${ff_cwe:-GENERIC}-${ff_level:-3}"
+        loc="${cfile}:${ff_lineno}"
+        # Strip temp file path from evidence - use relative path for clean output
+        ff_msg_clean="$(printf '%s' "$ff_msg" | sed "s|$tmp_dir/[^:]*:||g" | sed "s|$repo_dir/||g")"
+        evidence="${rule_id}: ${cfile}:${ff_lineno}: ${ff_msg_clean}"
+        risk="Flawfinder level ${ff_level:-?} (${ff_cwe:-unknown}): dangerous function or pattern detected in changed code."
+        action="Review this usage carefully; prefer safer alternatives (e.g. strlcpy over strcpy, snprintf over sprintf). See https://dwheeler.com/flawfinder/ and ${ff_cwe}."
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$sev" "security" "$loc" "$evidence" "$risk" "$action" "$rule_id" "https://dwheeler.com/flawfinder/" "high" >> "$flawfinder_raw_tsv"
+      done <<< "$ff_out"
+    done <<< "$all_ff_files"
+    if [[ -s "$flawfinder_raw_tsv" ]]; then
+      flawfinder_findings_total="$(wc -l < "$flawfinder_raw_tsv" | tr -d ' ')"
+    fi
+  fi
+fi
+
+# Optional external static rules pass (engine selected by EXTERNAL_YAML_ENGINE): disabled by default.
+# Supported engines: semgrep, gitlab_sast, datadog_custom_rules, clang_tidy, bearer, codeql
+is_semgrep_config_ref() {
+  local cfg="$1"
+  if [[ -f "$cfg" || -d "$cfg" ]]; then
+    return 0
+  fi
+  if [[ "$cfg" =~ ^(p/|r/|https?://) ]]; then
+    return 0
+  fi
+  return 1
+}
+
+is_semgrep_family_engine() {
+  case "${external_yaml_engine}" in
+    semgrep|gitlab_sast|gitlab-sast|gitlab|gitlab_sast_passthrough|datadog|datadog_custom_rules|datadog-custom-rules)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+extract_gitlab_sast_configs_from_toml() {
+  local toml="$1"
+  [[ -f "$toml" ]] || return 0
+  sed -n 's/^[[:space:]]*\(value\|path\)[[:space:]]*=[[:space:]]*"\([^"]\+\)".*/\2/p' "$toml"
+}
+
+external_yaml_abs_to_rel() {
+  local path="$1"
+  if [[ "$path" == file://* ]]; then
+    path="${path#file://}"
+  fi
+  if [[ "$path" == "$repo_dir/"* ]]; then
+    path="${path#"$repo_dir/"}"
+  fi
+  path="${path#./}"
+  printf '%s' "$path"
+}
+
+external_yaml_emit_finding() {
+  local cfile="$1"
+  local line="$2"
+  local rule_id="$3"
+  local msg="$4"
+  local sev_text="$5"
+  local meta_note="$6"
+  local reference="$7"
+  [[ "$line" =~ ^[0-9]+$ ]] || return 0
+  [[ -n "$cfile" ]] || return 0
+
+  external_yaml_findings_pre_filter=$((external_yaml_findings_pre_filter + 1))
+  local added_lines_for_file
+  added_lines_for_file="$(awk -F'\t' -v f="$cfile" '$1==f && $2~/^[0-9]+$/ {print $2}' "$added_lines_tsv")"
+  [[ -n "$added_lines_for_file" ]] || return 0
+
+  local in_window=0
+  local added_ln
+  while IFS= read -r added_ln; do
+    local delta=$(( line - added_ln ))
+    [[ $delta -lt 0 ]] && delta=$(( -delta ))
+    if [[ $delta -le $external_yaml_window ]]; then
+      in_window=1
+      break
+    fi
+  done <<< "$added_lines_for_file"
+  [[ "$in_window" -eq 1 ]] || return 0
+  external_yaml_findings_windowed=$((external_yaml_findings_windowed + 1))
+
+  local sev="medium"
+  if printf '%s' "$sev_text" | grep -Eqi 'error|high|critical'; then
+    sev="high"
+  fi
+  local msg_clean
+  msg_clean="$(printf '%s' "$msg" | sed 's/[[:space:]]\+/ /g' | cut -c1-160)"
+  local loc="${cfile}:${line}"
+  local evidence="${rule_id}: ${msg_clean}"
+  local risk="External analyzer rule (${meta_note:-external}) matched changed code."
+  local action="Validate the pattern in context and fix or explicitly suppress with rationale if intentional."
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$sev" "security" "$loc" "$evidence" "$risk" "$action" "$rule_id" "${reference:-external}" "high" >> "$external_yaml_raw_tsv"
+}
+
+external_yaml_semgrep_rule_prefix="SG"
+external_yaml_semgrep_meta_default="external-yaml"
+if [[ "${external_yaml_engine}" == "gitlab_sast" || "${external_yaml_engine}" == "gitlab-sast" || "${external_yaml_engine}" == "gitlab" || "${external_yaml_engine}" == "gitlab_sast_passthrough" ]]; then
+  external_yaml_semgrep_rule_prefix="GLS"
+  external_yaml_semgrep_meta_default="gitlab-sast"
+  if [[ -n "$external_yaml_gitlab_ruleset" ]]; then
+    external_yaml_config="$external_yaml_gitlab_ruleset"
+    external_yaml_config_display="$external_yaml_gitlab_ruleset"
+    external_yaml_config_list=()
+    IFS=',' read -r -a _gitlab_cfg_parts <<< "$external_yaml_gitlab_ruleset"
+    for _cfg in "${_gitlab_cfg_parts[@]}"; do
+      _cfg_trimmed="$(printf '%s' "$_cfg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [[ -n "$_cfg_trimmed" ]] || continue
+      external_yaml_config_list+=("$_cfg_trimmed")
+    done
+  fi
+  declare -a _gitlab_resolved_cfgs=()
+  for _cfg in "${external_yaml_config_list[@]}"; do
+    if [[ -f "$_cfg" && "$_cfg" == *.toml ]]; then
+      cfg_dir="$(cd "$(dirname "$_cfg")" && pwd)"
+      extracted_any=0
+      while IFS= read -r _gl_cfg; do
+        _gl_cfg_trimmed="$(printf '%s' "$_gl_cfg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [[ -n "$_gl_cfg_trimmed" ]] || continue
+        if [[ "$_gl_cfg_trimmed" != /* && -f "$cfg_dir/$_gl_cfg_trimmed" ]]; then
+          _gl_cfg_trimmed="$cfg_dir/$_gl_cfg_trimmed"
+        fi
+        _gitlab_resolved_cfgs+=("$_gl_cfg_trimmed")
+        extracted_any=1
+      done < <(extract_gitlab_sast_configs_from_toml "$_cfg")
+      if [[ "$extracted_any" -eq 0 ]]; then
+        printf 'external-yaml: gitlab ruleset had no passthrough value/path entries: %s\n' "$_cfg" >> "$external_yaml_log"
+      fi
+    else
+      _gitlab_resolved_cfgs+=("$_cfg")
+    fi
+  done
+  if [[ "${#_gitlab_resolved_cfgs[@]}" -gt 0 ]]; then
+    external_yaml_config_list=("${_gitlab_resolved_cfgs[@]}")
+    external_yaml_config_display="$(printf '%s' "${external_yaml_config_list[*]}" | tr ' ' ',')"
+  fi
+elif [[ "${external_yaml_engine}" == "datadog" || "${external_yaml_engine}" == "datadog_custom_rules" || "${external_yaml_engine}" == "datadog-custom-rules" ]]; then
+  external_yaml_semgrep_rule_prefix="DD"
+  external_yaml_semgrep_meta_default="datadog-custom"
+  if [[ -n "$external_yaml_datadog_rules" ]]; then
+    external_yaml_config="$external_yaml_datadog_rules"
+    external_yaml_config_display="$external_yaml_datadog_rules"
+    external_yaml_config_list=()
+    IFS=',' read -r -a _dd_cfg_parts <<< "$external_yaml_datadog_rules"
+    for _cfg in "${_dd_cfg_parts[@]}"; do
+      _cfg_trimmed="$(printf '%s' "$_cfg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [[ -n "$_cfg_trimmed" ]] || continue
+      external_yaml_config_list+=("$_cfg_trimmed")
+    done
+    if [[ "${#external_yaml_config_list[@]}" -gt 0 ]]; then
+      external_yaml_config_display="$(printf '%s' "${external_yaml_config_list[*]}" | tr ' ' ',')"
+    fi
+  fi
+fi
+
+if is_semgrep_family_engine; then
+  if ! command -v semgrep >/dev/null 2>&1; then
+    printf 'external-yaml: semgrep not found in PATH, skipping.\n' >> "$external_yaml_log"
+  else
+    invalid_sg_cfg=0
+    for _cfg in "${external_yaml_config_list[@]}"; do
+      if ! is_semgrep_config_ref "$_cfg"; then
+        printf 'external-yaml: config not found/invalid: %s\n' "$_cfg" >> "$external_yaml_log"
+        invalid_sg_cfg=1
+      fi
+    done
+    if [[ "$invalid_sg_cfg" -ne 0 ]]; then
+      :
+    else
+      external_yaml_ran=1
+      all_sg_files="$(jq -r '.[] | .filename // empty' "$files_json" 2>/dev/null | grep -E '\.(c|h|cc|cpp|cxx|hpp|hh)$' | sort -u || true)"
+      declare -a semgrep_targets=()
+      if [[ -n "$all_sg_files" ]]; then
+        while IFS= read -r cfile; do
+          [[ -n "$cfile" ]] || continue
+          abs_file="$repo_dir/$cfile"
+          [[ -f "$abs_file" ]] || continue
+          added_lines_for_file="$(awk -F'\t' -v f="$cfile" '$1==f && $2~/^[0-9]+$/ {print $2}' "$added_lines_tsv")"
+          [[ -n "$added_lines_for_file" ]] || continue
+          semgrep_targets+=("$abs_file")
+        done <<< "$all_sg_files"
+      fi
+      if [[ "${#semgrep_targets[@]}" -gt 0 ]]; then
+        semgrep_cmd=(
+          semgrep scan --quiet --json
+          --timeout "$external_yaml_semgrep_rule_timeout_sec"
+          --timeout-threshold "$external_yaml_semgrep_timeout_threshold"
+          --interfile-timeout 0
+          --max-target-bytes "$external_yaml_semgrep_max_target_bytes"
+          --jobs "$external_yaml_semgrep_jobs"
+        )
+        for _cfg in "${external_yaml_config_list[@]}"; do
+          semgrep_cmd+=(--config "$_cfg")
+        done
+        semgrep_cmd+=("${semgrep_targets[@]}")
+
+        sg_json=""
+        sg_rc=0
+        set +e
+        if command -v timeout >/dev/null 2>&1; then
+          sg_json="$(SEMGREP_SEND_METRICS=off timeout --signal=TERM "${external_yaml_semgrep_scan_timeout_sec}s" "${semgrep_cmd[@]}" 2>>"$external_yaml_log")"
+          sg_rc=$?
+        else
+          sg_json="$(SEMGREP_SEND_METRICS=off "${semgrep_cmd[@]}" 2>>"$external_yaml_log")"
+          sg_rc=$?
+        fi
+        set -e
+
+        if [[ "$sg_rc" -eq 124 || "$sg_rc" -eq 137 ]]; then
+          printf 'external-yaml: semgrep timed out (%ss) while scanning %s files.\n' \
+            "$external_yaml_semgrep_scan_timeout_sec" "${#semgrep_targets[@]}" >> "$external_yaml_log"
+        elif [[ "$sg_rc" -ne 0 && "$sg_rc" -ne 1 ]]; then
+          printf 'external-yaml: semgrep exited rc=%s while scanning %s files.\n' \
+            "$sg_rc" "${#semgrep_targets[@]}" >> "$external_yaml_log"
+        fi
+
+        if [[ -n "$sg_json" ]] && printf '%s' "$sg_json" | jq -e '.results? != null' >/dev/null 2>&1; then
+          while IFS=$'\t' read -r _sg_path sg_line sg_rule sg_msg sg_sev sg_cwe sg_owasp; do
+            [[ "$sg_line" =~ ^[0-9]+$ ]] || continue
+            external_yaml_findings_pre_filter=$((external_yaml_findings_pre_filter + 1))
+
+            cfile="$_sg_path"
+            if [[ "$cfile" == "$repo_dir/"* ]]; then
+              cfile="${cfile#"$repo_dir/"}"
+            fi
+            cfile="${cfile#./}"
+            [[ -n "$cfile" ]] || continue
+            added_lines_for_file="$(awk -F'\t' -v f="$cfile" '$1==f && $2~/^[0-9]+$/ {print $2}' "$added_lines_tsv")"
+            [[ -n "$added_lines_for_file" ]] || continue
+
+            in_window=0
+            while IFS= read -r added_ln; do
+              delta=$(( sg_line - added_ln ))
+              [[ $delta -lt 0 ]] && delta=$(( -delta ))
+              if [[ $delta -le $external_yaml_window ]]; then
+                in_window=1
+                break
+              fi
+            done <<< "$added_lines_for_file"
+            [[ $in_window -eq 1 ]] || continue
+            external_yaml_findings_windowed=$((external_yaml_findings_windowed + 1))
+
+            sev="medium"
+            if printf '%s' "$sg_sev" | grep -Eqi 'error'; then
+              sev="high"
+            fi
+            rid_clean="$(printf '%s' "$sg_rule" | tr '/: .@' '-' | tr -cd 'A-Za-z0-9_-')"
+            rule_id="${external_yaml_semgrep_rule_prefix}-${rid_clean:-RULE}"
+            meta_note=""
+            if [[ -n "$sg_cwe" ]]; then
+              meta_note="$sg_cwe"
+            elif [[ -n "$sg_owasp" ]]; then
+              meta_note="$sg_owasp"
+            else
+              meta_note="$external_yaml_semgrep_meta_default"
+            fi
+            sg_msg_clean="$(printf '%s' "$sg_msg" | sed 's/[[:space:]]\+/ /g' | cut -c1-160)"
+            loc="${cfile}:${sg_line}"
+            evidence="${rule_id}: ${sg_msg_clean}"
+            risk="External YAML rule (${meta_note}) matched changed C/C++ code."
+            action="Validate the pattern in context and fix or explicitly suppress with rationale if intentional."
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$sev" "security" "$loc" "$evidence" "$risk" "$action" "$rule_id" "$external_yaml_config_display" "high" >> "$external_yaml_raw_tsv"
+          done < <(printf '%s' "$sg_json" | jq -r '
+            .results[]? |
+            [
+              (.path // ""),
+              ((.start.line // 0) | tostring),
+              (.check_id // "rule"),
+              ((.extra.message // "") | gsub("[\\r\\n\\t]+"; " ")),
+              (.extra.severity // "WARNING"),
+              (
+                if ((.extra.metadata.cwe? // null) | type) == "array" then
+                  (.extra.metadata.cwe[0] // "")
+                else
+                  (.extra.metadata.cwe // .extra.metadata.cwe_id // "")
+                end
+              ),
+              (
+                if ((.extra.metadata.owasp? // null) | type) == "array" then
+                  (.extra.metadata.owasp[0] // "")
+                else
+                  (.extra.metadata.owasp // "")
+                end
+              )
+            ] | @tsv
+          ' 2>>"$external_yaml_log" || true)
+        fi
+        if [[ -s "$external_yaml_raw_tsv" ]]; then
+          external_yaml_findings_total="$(wc -l < "$external_yaml_raw_tsv" | tr -d ' ')"
+        fi
+      fi
+    fi
+  fi
+fi
+
+if [[ "${external_yaml_engine}" == "clang_tidy" || "${external_yaml_engine}" == "clang-tidy" ]]; then
+  if ! command -v clang-tidy >/dev/null 2>&1; then
+    printf 'external-yaml: clang-tidy not found in PATH, skipping.\n' >> "$external_yaml_log"
+  else
+    external_yaml_ran=1
+    all_ct_files="$(jq -r '.[] | .filename // empty' "$files_json" 2>/dev/null | grep -E '\.(c|h|cc|cpp|cxx|hpp|hh)$' | sort -u || true)"
+    if [[ -n "$all_ct_files" ]]; then
+      while IFS= read -r cfile; do
+        [[ -n "$cfile" ]] || continue
+        abs_file="$repo_dir/$cfile"
+        [[ -f "$abs_file" ]] || continue
+        added_lines_for_file="$(awk -F'\t' -v f="$cfile" '$1==f && $2~/^[0-9]+$/ {print $2}' "$added_lines_tsv")"
+        [[ -n "$added_lines_for_file" ]] || continue
+
+        ct_cmd=(clang-tidy --quiet --checks "$external_yaml_clang_tidy_checks" "$abs_file" --)
+        ct_out=""
+        ct_rc=0
+        set +e
+        if command -v timeout >/dev/null 2>&1; then
+          ct_out="$(timeout --signal=TERM "${external_yaml_clang_tidy_timeout_sec}s" "${ct_cmd[@]}" 2>&1)"
+          ct_rc=$?
+        else
+          ct_out="$("${ct_cmd[@]}" 2>&1)"
+          ct_rc=$?
+        fi
+        set -e
+        [[ -n "$ct_out" ]] && printf '%s\n' "$ct_out" >> "$external_yaml_log"
+        if [[ "$ct_rc" -eq 124 || "$ct_rc" -eq 137 ]]; then
+          printf 'external-yaml: clang-tidy timed out (%ss) on %s.\n' \
+            "$external_yaml_clang_tidy_timeout_sec" "$cfile" >> "$external_yaml_log"
+        fi
+
+        while IFS=$'\t' read -r ct_line ct_check ct_msg ct_sev; do
+          [[ "$ct_line" =~ ^[0-9]+$ ]] || continue
+          rid_clean="$(printf '%s' "$ct_check" | tr '/: .@' '-' | tr -cd 'A-Za-z0-9_-')"
+          rule_id="CT-${rid_clean:-RULE}"
+          external_yaml_emit_finding "$cfile" "$ct_line" "$rule_id" "$ct_msg" "$ct_sev" "${ct_check:-clang-tidy}" "clang-tidy"
+        done < <(printf '%s\n' "$ct_out" | awk -v f="$abs_file" '
+          index($0, f ":") == 1 {
+            n=split($0, a, ":");
+            if (n < 4) next;
+            line=a[2];
+            if (line !~ /^[0-9]+$/) next;
+            msg=a[4];
+            for (i=5; i<=n; i++) msg=msg ":" a[i];
+            sub(/^[[:space:]]+/, "", msg);
+            sev="warning";
+            if (msg ~ /^error:/) sev="error";
+            sub(/^(warning|error):[[:space:]]*/, "", msg);
+            check="clang-tidy";
+            if (match(msg, /\[[^][]+\][[:space:]]*$/)) {
+              check=substr(msg, RSTART+1, RLENGTH-2);
+              msg=substr(msg, 1, RSTART-1);
+              sub(/[[:space:]]+$/, "", msg);
+            }
+            gsub(/\t/, " ", msg);
+            print line "\t" check "\t" msg "\t" sev;
+          }
+        ')
+      done <<< "$all_ct_files"
+    fi
+    if [[ -s "$external_yaml_raw_tsv" ]]; then
+      external_yaml_findings_total="$(wc -l < "$external_yaml_raw_tsv" | tr -d ' ')"
+    fi
+  fi
+fi
+
+if [[ "${external_yaml_engine}" == "bearer" ]]; then
+  if ! command -v bearer >/dev/null 2>&1; then
+    printf 'external-yaml: bearer not found in PATH, skipping.\n' >> "$external_yaml_log"
+  else
+    external_yaml_ran=1
+    all_bearer_files="$(jq -r '.[] | .filename // empty' "$files_json" 2>/dev/null | grep -E '\.(c|h|cc|cpp|cxx|hpp|hh|go|py|java|js|ts|rb|php)$' | sort -u || true)"
+    if [[ -n "$all_bearer_files" ]]; then
+      while IFS= read -r cfile; do
+        [[ -n "$cfile" ]] || continue
+        abs_file="$repo_dir/$cfile"
+        [[ -f "$abs_file" ]] || continue
+        added_lines_for_file="$(awk -F'\t' -v f="$cfile" '$1==f && $2~/^[0-9]+$/ {print $2}' "$added_lines_tsv")"
+        [[ -n "$added_lines_for_file" ]] || continue
+
+        bearer_cmd=(bearer scan --quiet --format json --report security --scanner sast --exit-code 0 "$abs_file")
+        if [[ "${#external_yaml_config_list[@]}" -gt 0 ]]; then
+          for _cfg in "${external_yaml_config_list[@]}"; do
+            [[ -d "$_cfg" ]] && bearer_cmd+=(--external-rule-dir "$_cfg")
+          done
+        fi
+
+        br_json=""
+        br_rc=0
+        set +e
+        if command -v timeout >/dev/null 2>&1; then
+          br_json="$(timeout --signal=TERM "${external_yaml_bearer_timeout_sec}s" "${bearer_cmd[@]}" 2>>"$external_yaml_log")"
+          br_rc=$?
+        else
+          br_json="$("${bearer_cmd[@]}" 2>>"$external_yaml_log")"
+          br_rc=$?
+        fi
+        set -e
+
+        if [[ "$br_rc" -eq 124 || "$br_rc" -eq 137 ]]; then
+          printf 'external-yaml: bearer timed out (%ss) on %s.\n' \
+            "$external_yaml_bearer_timeout_sec" "$cfile" >> "$external_yaml_log"
+        fi
+        [[ -n "$br_json" ]] || continue
+
+        while IFS=$'\t' read -r br_path br_line br_rule br_msg br_sev br_cwe; do
+          [[ "$br_line" =~ ^[0-9]+$ ]] || continue
+          rel_path="$(external_yaml_abs_to_rel "$br_path")"
+          [[ -n "$rel_path" ]] || rel_path="$cfile"
+          rid_clean="$(printf '%s' "$br_rule" | tr '/: .@' '-' | tr -cd 'A-Za-z0-9_-')"
+          rule_id="BR-${rid_clean:-RULE}"
+          meta="${br_cwe:-bearer}"
+          external_yaml_emit_finding "$rel_path" "$br_line" "$rule_id" "$br_msg" "$br_sev" "$meta" "bearer"
+        done < <(printf '%s' "$br_json" | jq -r '
+          (
+            .findings[]?,
+            .results[]?,
+            .issues[]?,
+            .security[]?,
+            .vulnerabilities[]?
+          ) |
+          [
+            (.location.path // .path // ""),
+            ((.location.start_line // .location.start.line // .location.line // .line // 0) | tostring),
+            (.id // .rule_id // .check_id // .title // "rule"),
+            ((.description // .message // .title // .name // "") | gsub("[\\r\\n\\t]+"; " ")),
+            (.severity // .level // "WARNING"),
+            (.cwe // .metadata.cwe // "")
+          ] | @tsv
+        ' 2>>"$external_yaml_log" || true)
+      done <<< "$all_bearer_files"
+    fi
+    if [[ -s "$external_yaml_raw_tsv" ]]; then
+      external_yaml_findings_total="$(wc -l < "$external_yaml_raw_tsv" | tr -d ' ')"
+    fi
+  fi
+fi
+
+if [[ "${external_yaml_engine}" == "codeql" ]]; then
+  if ! command -v codeql >/dev/null 2>&1; then
+    printf 'external-yaml: codeql not found in PATH, skipping.\n' >> "$external_yaml_log"
+  elif [[ -z "$external_yaml_codeql_db" || ! -d "$external_yaml_codeql_db" ]]; then
+    printf 'external-yaml: codeql DB not set or missing (EXTERNAL_CODEQL_DB), skipping.\n' >> "$external_yaml_log"
+  else
+    external_yaml_ran=1
+    codeql_findings_tsv="$tmp_dir/codeql_findings.tsv"
+    : > "$codeql_findings_tsv"
+    codeql_cache_hit=0
+    codeql_cache_file=""
+    if [[ "$external_yaml_codeql_cache_disable" != "1" ]]; then
+      mkdir -p "$external_yaml_codeql_cache_dir" >/dev/null 2>&1 || true
+      codeql_db_sig="$(stat -c '%Y:%s' "$external_yaml_codeql_db/codeql-database.yml" 2>/dev/null || stat -c '%Y:%s' "$external_yaml_codeql_db" 2>/dev/null || echo "unknown")"
+      codeql_cache_key="$(printf '%s' "${external_yaml_codeql_db}|${external_yaml_codeql_query_suite}|${codeql_db_sig}" | sha256sum | awk '{print $1}')"
+      codeql_cache_file="$external_yaml_codeql_cache_dir/${codeql_cache_key}.tsv"
+      if [[ -s "$codeql_cache_file" ]]; then
+        codeql_cache_hit=1
+        cp "$codeql_cache_file" "$codeql_findings_tsv"
+        printf 'external-yaml: codeql cache hit (%s).\n' "$codeql_cache_file" >> "$external_yaml_log"
+      fi
+    fi
+
+    if [[ "$codeql_cache_hit" -ne 1 ]]; then
+      [[ "$external_yaml_codeql_cache_disable" == "1" ]] && printf 'external-yaml: codeql cache disabled.\n' >> "$external_yaml_log"
+      sarif_out="$tmp_dir/codeql_findings.sarif"
+      cq_cmd=(
+        codeql database analyze
+        --format=sarifv2.1.0
+        --output "$sarif_out"
+        --no-print-diagnostics-summary
+        --no-print-metrics-summary
+        --
+        "$external_yaml_codeql_db"
+        "$external_yaml_codeql_query_suite"
+      )
+      cq_rc=0
+      set +e
+      if command -v timeout >/dev/null 2>&1; then
+        timeout --signal=TERM "${external_yaml_codeql_timeout_sec}s" "${cq_cmd[@]}" >>"$external_yaml_log" 2>&1
+        cq_rc=$?
+      else
+        "${cq_cmd[@]}" >>"$external_yaml_log" 2>&1
+        cq_rc=$?
+      fi
+      set -e
+
+      if [[ "$cq_rc" -eq 124 || "$cq_rc" -eq 137 ]]; then
+        printf 'external-yaml: codeql timed out (%ss).\n' "$external_yaml_codeql_timeout_sec" >> "$external_yaml_log"
+      elif [[ "$cq_rc" -ne 0 ]]; then
+        printf 'external-yaml: codeql exited rc=%s.\n' "$cq_rc" >> "$external_yaml_log"
+      fi
+
+      if [[ -f "$sarif_out" ]]; then
+        jq -r '
+          .runs[]?.results[]? |
+          [
+            (.locations[0].physicalLocation.artifactLocation.uri // ""),
+            ((.locations[0].physicalLocation.region.startLine // 0) | tostring),
+            (.ruleId // "rule"),
+            ((.message.text // "") | gsub("[\\r\\n\\t]+"; " ")),
+            (.level // "warning"),
+            (
+              (
+                .properties.tags[]? // ""
+              ) | select(test("CWE-"; "i"))
+            )
+          ] | @tsv
+        ' "$sarif_out" > "$codeql_findings_tsv" 2>>"$external_yaml_log" || true
+      fi
+      if [[ -n "$codeql_cache_file" && -s "$codeql_findings_tsv" ]]; then
+        cp "$codeql_findings_tsv" "$codeql_cache_file" 2>/dev/null || true
+        printf 'external-yaml: codeql cache write (%s).\n' "$codeql_cache_file" >> "$external_yaml_log"
+      fi
+    fi
+
+    if [[ -s "$codeql_findings_tsv" ]]; then
+      while IFS=$'\t' read -r cq_path cq_line cq_rule cq_msg cq_sev cq_cwe; do
+        [[ "$cq_line" =~ ^[0-9]+$ ]] || continue
+        rel_path="$(external_yaml_abs_to_rel "$cq_path")"
+        [[ -n "$rel_path" ]] || continue
+        if [[ -s "$pr_files_txt" ]] && ! grep -Fqx -- "$rel_path" "$pr_files_txt"; then
+          continue
+        fi
+        rid_clean="$(printf '%s' "$cq_rule" | tr '/: .@' '-' | tr -cd 'A-Za-z0-9_-')"
+        rule_id="CQ-${rid_clean:-RULE}"
+        meta="${cq_cwe:-codeql}"
+        external_yaml_emit_finding "$rel_path" "$cq_line" "$rule_id" "$cq_msg" "$cq_sev" "$meta" "${external_yaml_codeql_query_suite}"
+      done < "$codeql_findings_tsv"
+    fi
+    if [[ -s "$external_yaml_raw_tsv" ]]; then
+      external_yaml_findings_total="$(wc -l < "$external_yaml_raw_tsv" | tr -d ' ')"
+    fi
+  fi
+fi
+
 while IFS=$'\t' read -r cid path line reviewer body; do
   loc="${path}:${line}"
   [[ -z "$path" ]] && loc="review-comment"
@@ -1992,15 +3047,27 @@ run_bug_model_signal() {
     location_text="${bug_model_hunk_file}:${bug_model_hunk_line}"
   fi
 
-  if [[ "$predicted_flag" == "true" && "$bug_model_review_mode" == "actual-bug" && -n "$bug_model_family" ]]; then
+  if [[ "$bug_model_review_mode" == "actual-bug" && -n "$bug_model_family" ]]; then
     severity="high"
     add_finding "$severity" "correctness" "$location_text" \
       "Model-assisted detector predicts ${bug_model_family} (risk=${bug_model_risk_score}, family=${bug_model_family_score}, hunk=${bug_model_best_hunk_score}, mode=${bug_model_review_mode}, memory_used=${bug_model_memory_used})." \
       "Likely ${bug_model_family} defect in changed code path; merge without targeted validation may ship a latent vulnerability/regression." \
       "$action_text" \
       "ML-PAIRWISE-DETECTOR" "https://github.com/slingappa/ml-bug-feature-extractor"
+  elif [[ "$bug_model_review_mode" == "actual-bug-lite" && -n "$bug_model_family" ]]; then
+    severity="high"
+    add_finding "$severity" "correctness" "$location_text" \
+      "Model-assisted detector flagged ${bug_model_family} via lite gates (risk=${bug_model_risk_score}, family=${bug_model_family_score}, hunk=${bug_model_best_hunk_score}, mode=${bug_model_review_mode}, memory_used=${bug_model_memory_used})." \
+      "Likely ${bug_model_family} defect in changed code path; treat as high-priority manual validation even though strict family gate did not pass." \
+      "$action_text" \
+      "ML-PAIRWISE-DETECTOR" "https://github.com/slingappa/ml-bug-feature-extractor"
   elif [[ "$predicted_flag" == "true" ]]; then
-    add_finding "$severity" "correctness" "model-scorer" \
+    if [[ "$location_text" != "model-scorer" ]] && float_ge "$bug_model_best_hunk_score" "$bug_guarded_risk_min_hunk"; then
+      :
+    else
+      location_text="model-scorer"
+    fi
+    add_finding "$severity" "correctness" "$location_text" \
       "Model-assisted detector raised risk signal (risk=${bug_model_risk_score}, family=${bug_model_family:-unknown}, family_score=${bug_model_family_score}, mode=${bug_model_review_mode})." \
       "Patch appears bug-prone but bug-family/location confidence did not pass full gates." \
       "$action_text" \
@@ -2213,6 +3280,34 @@ fi
 
 # Model-assisted bug signal (optional): inject bug-family/location findings into the same review flow.
 run_bug_model_signal
+inject_high_risk_model_fallback_comment
+inject_risk_only_model_fallback_comment
+
+# Emit flawfinder findings after model signal so we can suppress line-duplicate comments.
+if [[ -s "$flawfinder_raw_tsv" ]]; then
+  while IFS=$'\t' read -r sev cat loc evidence risk action rid rsrc rconf; do
+    [[ -n "$sev" && -n "$loc" ]] || continue
+    if [[ "$rid" == FF-* ]] && grep -Fqx "$loc" "$model_comment_locations_txt"; then
+      flawfinder_findings_deduped=$((flawfinder_findings_deduped + 1))
+      continue
+    fi
+    add_finding "$sev" "$cat" "$loc" "$evidence" "$risk" "$action" "$rid" "$rsrc"
+    flawfinder_findings_emitted=$((flawfinder_findings_emitted + 1))
+  done < "$flawfinder_raw_tsv"
+fi
+
+# Emit external YAML findings after model signal for file:line dedup.
+if [[ -s "$external_yaml_raw_tsv" ]]; then
+  while IFS=$'\t' read -r sev cat loc evidence risk action rid rsrc rconf; do
+    [[ -n "$sev" && -n "$loc" ]] || continue
+    if [[ "$rid" == SG-* ]] && grep -Fqx "$loc" "$model_comment_locations_txt"; then
+      external_yaml_findings_deduped=$((external_yaml_findings_deduped + 1))
+      continue
+    fi
+    add_finding "$sev" "$cat" "$loc" "$evidence" "$risk" "$action" "$rid" "$rsrc"
+    external_yaml_findings_emitted=$((external_yaml_findings_emitted + 1))
+  done < "$external_yaml_raw_tsv"
+fi
 
 # Build deterministic comment-submit batches for human-approved posting.
 proposed_comments_total=0
@@ -2692,17 +3787,70 @@ fi
   if [[ "$kernel_vuln_rules_ran" -eq 1 ]]; then
     echo "- Kernel-vuln rule findings generated: ${kernel_vuln_findings_total}"
   fi
+  echo "- Flawfinder static analysis ran: $([[ "$flawfinder_ran" -eq 1 ]] && echo yes || echo no)"
+  if [[ "$flawfinder_ran" -eq 1 ]]; then
+    echo "- Flawfinder findings parsed: ${flawfinder_findings_pre_filter}"
+    echo "- Flawfinder findings diff-adjacent (<= +/-3): ${flawfinder_findings_windowed}"
+    echo "- Flawfinder findings post-filter artifact rows: ${flawfinder_findings_total}"
+    echo "- Flawfinder findings suppressed by model line dedup: ${flawfinder_findings_deduped}"
+    echo "- Flawfinder findings emitted: ${flawfinder_findings_emitted}"
+    echo "- Flawfinder minlevel: ${FLAWFINDER_MINLEVEL:-4}"
+  fi
+  echo "- Diff-native heuristics enabled: $([[ "$diff_native_heuristics" == "1" ]] && echo yes || echo no)"
+  if [[ "$diff_native_heuristics" == "1" ]]; then
+    echo "- Diff-native window: ${diff_native_window}"
+    echo "- Diff-native max findings per rule: ${diff_native_max_findings}"
+    echo "- Diff-native strict mode: $([[ "$diff_native_strict" == "1" ]] && echo yes || echo no)"
+  fi
+  echo "- External YAML static rules ran: $([[ "$external_yaml_ran" -eq 1 ]] && echo yes || echo no)"
+  if [[ "$external_yaml_ran" -eq 1 ]]; then
+    echo "- External YAML engine: ${external_yaml_engine}"
+    echo "- External YAML config: ${external_yaml_config_display}"
+    echo "- External YAML findings parsed: ${external_yaml_findings_pre_filter}"
+    echo "- External YAML findings diff-adjacent (<= +/-${external_yaml_window}): ${external_yaml_findings_windowed}"
+    echo "- External YAML findings post-filter artifact rows: ${external_yaml_findings_total}"
+    echo "- External YAML findings suppressed by model line dedup: ${external_yaml_findings_deduped}"
+    echo "- External YAML findings emitted: ${external_yaml_findings_emitted}"
+    if [[ "${external_yaml_engine}" == "semgrep" || "${external_yaml_engine}" == "gitlab_sast" || "${external_yaml_engine}" == "gitlab-sast" || "${external_yaml_engine}" == "gitlab" || "${external_yaml_engine}" == "gitlab_sast_passthrough" || "${external_yaml_engine}" == "datadog" || "${external_yaml_engine}" == "datadog_custom_rules" || "${external_yaml_engine}" == "datadog-custom-rules" ]]; then
+      echo "- External YAML Semgrep rule timeout: ${external_yaml_semgrep_rule_timeout_sec}s"
+      echo "- External YAML Semgrep scan timeout: ${external_yaml_semgrep_scan_timeout_sec}s"
+      echo "- External YAML Semgrep timeout threshold: ${external_yaml_semgrep_timeout_threshold}"
+      echo "- External YAML Semgrep max-target-bytes: ${external_yaml_semgrep_max_target_bytes}"
+      echo "- External YAML Semgrep jobs: ${external_yaml_semgrep_jobs}"
+      if [[ "${external_yaml_engine}" == "gitlab_sast" || "${external_yaml_engine}" == "gitlab-sast" || "${external_yaml_engine}" == "gitlab" || "${external_yaml_engine}" == "gitlab_sast_passthrough" ]]; then
+        echo "- External GitLab SAST ruleset: ${external_yaml_gitlab_ruleset:-unset}"
+      elif [[ "${external_yaml_engine}" == "datadog" || "${external_yaml_engine}" == "datadog_custom_rules" || "${external_yaml_engine}" == "datadog-custom-rules" ]]; then
+        echo "- External Datadog rules: ${external_yaml_datadog_rules:-unset}"
+      fi
+    elif [[ "${external_yaml_engine}" == "clang_tidy" || "${external_yaml_engine}" == "clang-tidy" ]]; then
+      echo "- External YAML clang-tidy checks: ${external_yaml_clang_tidy_checks}"
+      echo "- External YAML clang-tidy timeout: ${external_yaml_clang_tidy_timeout_sec}s"
+    elif [[ "${external_yaml_engine}" == "bearer" ]]; then
+      echo "- External YAML bearer timeout: ${external_yaml_bearer_timeout_sec}s"
+    elif [[ "${external_yaml_engine}" == "codeql" ]]; then
+      echo "- External YAML CodeQL DB: ${external_yaml_codeql_db:-unset}"
+      echo "- External YAML CodeQL query suite: ${external_yaml_codeql_query_suite}"
+      echo "- External YAML CodeQL timeout: ${external_yaml_codeql_timeout_sec}s"
+      echo "- External YAML CodeQL cache dir: ${external_yaml_codeql_cache_dir}"
+      echo "- External YAML CodeQL cache disabled: $([[ "${external_yaml_codeql_cache_disable}" == "1" ]] && echo yes || echo no)"
+    fi
+  fi
   echo "- Model-assisted bug detector ran: $([[ "$bug_model_ran" -eq 1 ]] && echo yes || echo no)"
   echo "- Model-assisted bug detector status: ${bug_model_status}"
   echo "- Model source: ${bug_model_source}"
   if [[ "$bug_model_status" == "ok" ]]; then
     echo "- Model artifact: ${bug_model_path}"
     echo "- Model thresholds: binary=${bug_binary_threshold}, family=${bug_family_threshold}, hunk=${bug_hunk_threshold}, topk_hunks=${bug_topk_hunks}"
+    echo "- Model guarded-risk min hunk: ${bug_guarded_risk_min_hunk}"
+    echo "- Model high-risk fallback threshold: ${bug_high_risk_fallback_threshold}"
+    echo "- Model risk-only fallback threshold: ${bug_risk_only_fallback_threshold:-disabled}"
     echo "- Model review mode: ${bug_model_review_mode:-unknown}"
     echo "- Model risk score: ${bug_model_risk_score}"
     echo "- Model predicted family: ${bug_model_family:-unknown} (score=${bug_model_family_score})"
     echo "- Model top hunk: ${bug_model_hunk_file:-n/a}:${bug_model_hunk_line:-n/a} (confidence=${bug_model_best_hunk_score})"
     echo "- Model commit-memory hit: ${bug_model_memory_used}"
+    echo "- Model fallback draft injected: $([[ "$bug_model_fallback_injected" -eq 1 ]] && echo yes || echo no)"
+    echo "- Model risk-only fallback injected: $([[ "$bug_model_risk_fallback_injected" -eq 1 ]] && echo yes || echo no)"
   fi
   echo
   echo '```text'
@@ -2802,12 +3950,21 @@ fi
 } > "$review_comments_md"
 
 review_comments_out="$context_dir/review_comments.md"
+artifact_out_dir="$context_dir"
 if [[ -n "$report_file" ]]; then
   review_comments_out="$(dirname "$report_file")/review_comments.md"
+  artifact_out_dir="$(dirname "$report_file")"
 elif [[ -n "$output_file" ]]; then
   review_comments_out="$(dirname "$output_file")/review_comments.md"
+  artifact_out_dir="$(dirname "$output_file")"
 fi
 cp "$review_comments_md" "$review_comments_out"
+if [[ "$flawfinder_ran" -eq 1 ]]; then
+  cp "$flawfinder_raw_tsv" "$artifact_out_dir/flawfinder_findings.tsv"
+fi
+if [[ "$external_yaml_ran" -eq 1 ]]; then
+  cp "$external_yaml_raw_tsv" "$artifact_out_dir/external_yaml_findings.tsv"
+fi
 
 if [[ -n "$report_file" ]]; then
   cp "$report_md" "$report_file"
